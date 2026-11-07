@@ -285,15 +285,24 @@ export class EmceptionService {
       try {
         console.log('[EmceptionService] Initializing Emception headless compiler toolchain...');
 
-        // Check if local manifest exists, otherwise use CDN
-        let manifest = '/emception-cdn/manifest.json';
-        try {
-          const testRes = await fetch(manifest, { method: 'HEAD' });
-          if (!testRes.ok) {
+        // In production (GitHub Pages / custom domain), directly use high-speed jsDelivr CDN manifest;
+        // only probe local dev middleware when running on localhost.
+        const isLocalDev = typeof window !== 'undefined' && (
+          window.location.hostname === 'localhost' ||
+          window.location.hostname === '127.0.0.1' ||
+          window.location.hostname === '0.0.0.0'
+        );
+
+        let manifest = DEFAULT_MANIFEST_URL;
+        if (isLocalDev) {
+          try {
+            const testRes = await fetch('/emception-cdn/manifest.json', { method: 'HEAD' });
+            if (testRes.ok) {
+              manifest = '/emception-cdn/manifest.json';
+            }
+          } catch {
             manifest = DEFAULT_MANIFEST_URL;
           }
-        } catch {
-          manifest = DEFAULT_MANIFEST_URL;
         }
 
         console.log('[EmceptionService] Using toolchain manifest:', manifest);
