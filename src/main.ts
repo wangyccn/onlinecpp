@@ -346,6 +346,20 @@ class OnlineCppIDE {
       this.renderDiagnostics(items);
     });
 
+    // Language Server Status Updates
+    this.clangdService.onStatusChange(() => {
+      this.updateStatus();
+    });
+
+    // Real-time Editor Synchronization to Language Server
+    this.editorService.onContentChange((path, content, version) => {
+      this.clangdService.updateDocument(`file:///${path}`, content, version);
+    });
+
+    this.editorService.onModelChange((path, model) => {
+      this.clangdService.attachDocument(`file:///${path}`, model.getValue());
+    });
+
     // 9. Attach Button Listeners
     this.bindEvents();
 

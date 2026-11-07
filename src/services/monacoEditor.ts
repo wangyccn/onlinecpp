@@ -10,6 +10,8 @@ export class MonacoEditorService {
   private onSaveCallback: ((path: string, content: string) => Promise<void> | void) | null = null;
   private onTabsChangedCallbacks: Array<(tabs: OpenTab[], activePath: string | null) => void> = [];
   private onCursorChangeCallbacks: Array<(line: number, col: number) => void> = [];
+  private onContentChangeCallbacks: Array<(path: string, content: string, version: number) => void> = [];
+  private onModelChangeCallbacks: Array<(path: string, model: monaco.editor.ITextModel) => void> = [];
   private autoSaveEnabled = true;
   private autoSaveTimer: any = null;
 
@@ -64,9 +66,18 @@ export class MonacoEditorService {
       }
     });
 
-    // Track Model Content Changes (Dirty State & Auto-Save)
+    // Track Model Content Changes (Dirty State, Auto-Save, and Real-time Language Server Sync)
     this.editor.onDidChangeModelContent(() => {
       if (this.activePath) {
+        const model = this.editor?.getModel();
+        if (model) {
+          const content = model.getValue();
+          const version = model.getVersionId();
+          for (const cb of this.onContentChangeCallbacks) {
+            cb(this.activePath, content, version);
+          }
+        }
+
         const tab = this.openTabs.find((t) => t.path === this.activePath);
         if (tab && !tab.isDirty) {
           tab.isDirty = true;
@@ -104,6 +115,20 @@ export class MonacoEditorService {
     this.onCursorChangeCallbacks.push(callback);
     return () => {
       this.onCursorChangeCallbacks = this.onCursorChangeCallbacks.filter((c) => c !== callback);
+    };
+  }
+
+  public onContentChange(callback: (path: string, content: string, version: number) => void): () => void {
+    this.onContentChangeCallbacks.push(callback);
+    return () => {
+      this.onContentChangeCallbacks = this.onContentChangeCallbacks.filter((c) => c !== callback);
+    };
+  }
+
+  public onModelChange(callback: (path: string, model: monaco.editor.ITextModel) => void): () => void {
+    this.onModelChangeCallbacks.push(callback);
+    return () => {
+      this.onModelChangeCallbacks = this.onModelChangeCallbacks.filter((c) => c !== callback);
     };
   }
 
@@ -151,6 +176,10 @@ export class MonacoEditorService {
     if (this.editor) {
       this.editor.setModel(model);
       this.editor.focus();
+    }
+
+    for (const cb of this.onModelChangeCallbacks) {
+      cb(path, model);
     }
 
     this.notifyTabsChanged();
