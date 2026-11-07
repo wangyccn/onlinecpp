@@ -22,9 +22,10 @@ export class MonacoEditorService {
       window.MonacoEnvironment = {
         getWorker(_: string, _label: string) {
           try {
-            return new Worker(new URL('/workers/editor.worker.js', window.location.origin));
+            const workerUrl = new URL('workers/editor.worker.js', window.location.href);
+            return new Worker(workerUrl);
           } catch {
-            return new Worker('/workers/editor.worker.js');
+            return new Worker('./workers/editor.worker.js');
           }
         },
       };
