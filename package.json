@@ -1,0 +1,26 @@
+{
+  "name": "onlinecpp",
+  "version": "1.0.0",
+  "description": "Native-grade in-browser C++ IDE powered by WebAssembly, Clang, Monaco Editor and xterm.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "deploy": "wrangler pages deploy dist --project-name onlinecpp"
+  },
+  "devDependencies": {
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6"
+  },
+  "dependencies": {
+    "@algoproclub/clangd-wasm": "^0.1.1",
+    "@gameguild/emception-browser": "^4.5.2",
+    "@gameguild/emception-xterm": "^4.5.2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "emception": "^4.5.2",
+    "lucide": "^1.70.0",
+    "monaco-editor": "^0.57.0"
+  }
+}
