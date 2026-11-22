@@ -1,19 +1,6 @@
 import { defineConfig } from 'vite';
 import path from 'path';
 import fs from 'fs';
-import { execSync } from 'child_process';
-
-// Ensure static Monaco Editor worker exists
-const workerDir = path.resolve(import.meta.dirname, 'public/workers');
-const workerPath = path.resolve(workerDir, 'editor.worker.js');
-if (!fs.existsSync(workerPath)) {
-  fs.mkdirSync(workerDir, { recursive: true });
-  try {
-    execSync('npx esbuild node_modules/monaco-editor/esm/vs/editor/editor.worker.js --bundle --minify --format=iife --outfile=public/workers/editor.worker.js', { stdio: 'inherit' });
-  } catch (err) {
-    console.warn('[ViteConfig] Failed to bundle editor.worker.js with esbuild:', err);
-  }
-}
 
 export default defineConfig({
   base: './',
@@ -39,15 +26,24 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
+    include: ['@algoproclub/clangd-wasm > vscode-jsonrpc/lib/common/messages.js'],
     exclude: [
       '@gameguild/emception-browser',
       '@gameguild/emception-xterm',
       'emception',
       '@algoproclub/clangd-wasm',
+      '@emception-runtime/vfs/lazy.js',
+      '@emception-runtime/vfs/idb.js',
+      '@emception-runtime/vfs/index.js',
+      '@emception-runtime/tool-runner.js',
+      '@emception-runtime/manifest.js',
     ],
   },
   resolve: {
     alias: [
+      { find: '@clangd-broker', replacement: path.resolve(import.meta.dirname, 'node_modules/@algoproclub/clangd-wasm/lib/clangd.shared-worker.js') },
+      // Worker-safe runtime modules; the package root also imports DOM/xterm boot code.
+      { find: '@emception-runtime', replacement: path.resolve(import.meta.dirname, 'node_modules/@gameguild/emception-browser/dist') },
       {
         find: /@gameguild\/emception-browser\/dist\/worker-entry$/,
         replacement: path.resolve(import.meta.dirname, 'node_modules/@gameguild/emception-browser/dist/worker-entry.js'),
@@ -55,6 +51,16 @@ export default defineConfig({
     ],
   },
   plugins: [
+    {
+      name: 'clangd-worker-entry',
+      enforce: 'pre',
+      transform(code, id) {
+        if (!id.replace(/\\/g, '/').endsWith('/@algoproclub/clangd-wasm/lib/browser.js')) return;
+        const constructor = 'new URL("./clangd.shared-worker.js", import.meta.url)';
+        if (!code.includes(constructor)) throw new Error('clangd worker entry changed; update the Vite integration');
+        return 'import clangdWorkerUrl from "/src/workers/clangd.worker.ts?sharedworker&url";\n' + code.replace(constructor, 'clangdWorkerUrl').replace('name: "algopro-clangd"', 'name: "onlinecpp-clangd"');
+      },
+    },
     {
       name: 'monaco-language-filter',
       enforce: 'pre',

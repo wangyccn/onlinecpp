@@ -1,5 +1,6 @@
 import * as monaco from 'monaco-editor';
 import { OpenTab, EditorSettings } from '../types';
+import { WriteQueue } from './writeQueue';
 
 export class MonacoEditorService {
   private editor: monaco.editor.IStandaloneCodeEditor | null = null;
@@ -13,7 +14,21 @@ export class MonacoEditorService {
   private onContentChangeCallbacks: Array<(path: string, content: string, version: number) => void> = [];
   private onModelChangeCallbacks: Array<(path: string, model: monaco.editor.ITextModel) => void> = [];
   private autoSaveEnabled = true;
-  private autoSaveTimer: any = null;
+  private queuedSaves = new Map<string, { version: number; promise: Promise<void> }>();
+  private saves = new WriteQueue<{ content: string; version: number }>(async (path, snapshot) => {
+    if (!this.onSaveCallback) throw new Error('No save handler registered');
+    await this.onSaveCallback(path, snapshot.content);
+    const tab = this.openTabs.find((item) => item.path === path);
+    const model = this.models.get(path);
+    // An older completion must never mark newer edits as saved.
+    if (tab && model && !model.isDisposed() && model.getVersionId() === snapshot.version) {
+      tab.content = snapshot.content;
+      tab.isDirty = false;
+      this.notifyTabsChanged();
+    }
+  });
+  private onSaveErrorCallback: ((path: string, error: unknown) => void) | null = null;
+  private updatingFromDisk = false;
 
   constructor() {
     this.setupWorkerEnvironment();
@@ -23,18 +38,14 @@ export class MonacoEditorService {
     if (typeof window !== 'undefined') {
       window.MonacoEnvironment = {
         getWorker(_: string, _label: string) {
-          try {
-            const workerUrl = new URL('workers/editor.worker.js', window.location.href);
-            return new Worker(workerUrl);
-          } catch {
-            return new Worker('./workers/editor.worker.js');
-          }
+          return new Worker(new URL('../workers/editor.worker.ts', import.meta.url), { type: 'module' });
         },
       };
     }
   }
 
   public mount(container: HTMLElement, settings: EditorSettings): void {
+    this.autoSaveEnabled = settings.autoSave !== false;
     this.editor = monaco.editor.create(container, {
       value: '',
       language: 'cpp',
@@ -51,12 +62,14 @@ export class MonacoEditorService {
       renderLineHighlight: 'all',
       smoothScrolling: true,
       cursorBlinking: 'smooth',
+      quickSuggestions: { other: true, comments: false, strings: false },
+      wordBasedSuggestions: 'off',
       padding: { top: 12, bottom: 12 },
     });
 
     // Keybindings: Ctrl+S / Cmd+S to Save
     this.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-      this.saveActiveFile();
+      this.saveActiveFile().catch((error) => this.reportSaveError(this.activePath || '', error));
     });
 
     // Track Cursor Position
@@ -67,24 +80,11 @@ export class MonacoEditorService {
     });
 
     // Track Model Content Changes (Dirty State, Auto-Save, and Real-time Language Server Sync)
-    this.editor.onDidChangeModelContent(() => {
-      if (this.activePath) {
-        const model = this.editor?.getModel();
-        if (model) {
-          const content = model.getValue();
-          const version = model.getVersionId();
-          for (const cb of this.onContentChangeCallbacks) {
-            cb(this.activePath, content, version);
-          }
-        }
-
-        const tab = this.openTabs.find((t) => t.path === this.activePath);
-        if (tab && !tab.isDirty) {
-          tab.isDirty = true;
-          this.notifyTabsChanged();
-        }
-        this.triggerAutoSave();
-      }
+    window.addEventListener('beforeunload', (event) => {
+      if (this.hasUnsavedChanges()) { event.preventDefault(); event.returnValue = ''; }
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden' && this.autoSaveEnabled) this.saveAllFiles().catch((error) => this.reportSaveError('', error));
     });
   }
 
@@ -136,6 +136,13 @@ export class MonacoEditorService {
     this.onSaveCallback = callback;
   }
 
+  public onSaveError(callback: (path: string, error: unknown) => void): void { this.onSaveErrorCallback = callback; }
+  private reportSaveError(path: string, error: unknown): void {
+    console.error(`[Save] ${path}`, error);
+    this.onSaveErrorCallback?.(path, error);
+  }
+  public hasUnsavedChanges(): boolean { return this.saves.busy || this.openTabs.some((tab) => tab.isDirty); }
+
   public getActiveContent(): string | null {
     return this.editor?.getModel()?.getValue() ?? null;
   }
@@ -163,6 +170,16 @@ export class MonacoEditorService {
       const uri = monaco.Uri.parse(`file:///${path}`);
       model = monaco.editor.getModel(uri) || monaco.editor.createModel(content, this.detectLanguage(path), uri);
       this.models.set(path, model);
+      const trackedModel = model;
+      model.onDidChangeContent(() => {
+        const content = trackedModel.getValue(), version = trackedModel.getVersionId();
+        const tab = this.openTabs.find((item) => item.path === path);
+        if (tab && !tab.isDirty && !this.updatingFromDisk) { tab.isDirty = true; this.notifyTabsChanged(); }
+        for (const cb of this.onContentChangeCallbacks) cb(path, content, version);
+        if (this.autoSaveEnabled && !this.updatingFromDisk) {
+          this.queueSave(path, content, version, 800).catch((error) => this.reportSaveError(path, error));
+        }
+      });
     }
 
     let tab = this.openTabs.find((t) => t.path === path);
@@ -185,9 +202,15 @@ export class MonacoEditorService {
     this.notifyTabsChanged();
   }
 
-  public closeTab(path: string): void {
-    const index = this.openTabs.findIndex((t) => t.path === path);
+  public async closeTab(path: string): Promise<void> {
+    let index = this.openTabs.findIndex((t) => t.path === path);
     if (index === -1) return;
+    if (this.openTabs[index].isDirty) {
+      try { await this.saveFile(path); } catch (error) { this.reportSaveError(path, error); return; }
+      index = this.openTabs.findIndex((t) => t.path === path);
+      if (index === -1) return;
+      if (this.openTabs[index]?.isDirty) return;
+    }
 
     this.openTabs.splice(index, 1);
 
@@ -205,25 +228,50 @@ export class MonacoEditorService {
     }
 
     this.notifyTabsChanged();
+    this.models.get(path)?.dispose();
+    this.models.delete(path);
   }
 
   public async saveActiveFile(): Promise<void> {
-    if (!this.activePath || !this.editor) return;
+    if (this.activePath) await this.saveFile(this.activePath);
+  }
 
-    const model = this.editor.getModel();
-    if (!model) return;
+  /** Dispose every descendant before a destructive filesystem operation. */
+  public async closeTabsUnder(path: string): Promise<void> {
+    const matches = (candidate: string) => candidate === path || candidate.startsWith(path + '/');
+    for (const tab of this.getOpenTabs().filter((tab) => matches(tab.path))) await this.closeTab(tab.path);
+    if (this.openTabs.some((tab) => matches(tab.path))) throw new Error('Files changed or could not be saved; retry after saving before removing or moving them');
+  }
 
-    const content = model.getValue();
-    const tab = this.openTabs.find((t) => t.path === this.activePath);
-    if (tab) {
-      tab.isDirty = false;
-      tab.content = content;
-      this.notifyTabsChanged();
+  private saveFile(path: string): Promise<void> {
+    const model = this.models.get(path);
+    if (!model || model.isDisposed() || !this.openTabs.find((tab) => tab.path === path)?.isDirty) return Promise.resolve();
+    return this.queueSave(path, model.getValue(), model.getVersionId());
+  }
+
+  private queueSave(path: string, content: string, version: number, delay = 0): Promise<void> {
+    const queued = this.queuedSaves.get(path);
+    if (queued?.version === version) {
+      return delay ? queued.promise : Promise.all([queued.promise, this.saves.flush(path)]).then(() => {});
     }
+    const promise = this.saves.enqueue(path, { content, version }, delay);
+    this.queuedSaves.set(path, { version, promise });
+    const clear = () => { if (this.queuedSaves.get(path)?.promise === promise) this.queuedSaves.delete(path); };
+    promise.then(clear, clear);
+    return promise;
+  }
 
-    if (this.onSaveCallback) {
-      await this.onSaveCallback(this.activePath, content);
-    }
+  public async saveAllFiles(): Promise<void> {
+    await Promise.all(this.openTabs.filter((tab) => tab.isDirty).map((tab) => this.saveFile(tab.path)));
+    await this.saves.flush();
+  }
+
+  public resetWorkspace(): void {
+    if (this.hasUnsavedChanges()) throw new Error('Save all files before switching folders');
+    this.editor?.setModel(null);
+    this.models.forEach((model) => model.dispose());
+    this.models.clear(); this.openTabs = []; this.activePath = null;
+    this.notifyTabsChanged();
   }
 
   public updateFileContent(path: string, newContent: string): void {
@@ -233,20 +281,23 @@ export class MonacoEditorService {
     }
   }
 
+  public updateFileFromDisk(path: string, text: string): void {
+    const tab = this.openTabs.find((item) => item.path === path), model = this.models.get(path);
+    if (!tab || tab.isDirty || !model || model.isDisposed()) return;
+    this.updatingFromDisk = true;
+    try { if (model.getValue() !== text) model.setValue(text); tab.content = text; }
+    finally { this.updatingFromDisk = false; }
+  }
+
+  public getDirtyModelsContent(): Record<string, string> {
+    const content = this.getAllOpenModelsContent();
+    return Object.fromEntries(this.openTabs.filter((tab) => tab.isDirty).map((tab) => [tab.path, content[tab.path]]));
+  }
+
   public formatDocument(): void {
     if (this.editor) {
       this.editor.getAction('editor.action.formatDocument')?.run();
     }
-  }
-
-  private triggerAutoSave(): void {
-    if (!this.autoSaveEnabled) return;
-    if (this.autoSaveTimer) {
-      clearTimeout(this.autoSaveTimer);
-    }
-    this.autoSaveTimer = setTimeout(() => {
-      this.saveActiveFile();
-    }, 1000);
   }
 
   public applySettings(settings: EditorSettings): void {

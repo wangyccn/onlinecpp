@@ -34,3 +34,6 @@ dist-ssr
 *.tmp
 *.swp
 *.bak
+
+# Agent workspace notes
+.workbuddy-ai/

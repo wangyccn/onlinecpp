@@ -20,6 +20,23 @@ export class TerminalService {
   private isRunningProgram = false;
   private programStdinCallback: ((data: string) => void) | null = null;
   private currentDir = '';
+  private commandBusy = false;
+  private taskDepth = 0;
+  private interruptHandler: (() => void) | null = null;
+
+  /** A foreground compiler owns the terminal just like a foreground Linux process. */
+  public beginTask(interrupt: () => void): () => void {
+    this.taskDepth++;
+    const previous = this.interruptHandler;
+    this.interruptHandler = interrupt;
+    this.currentInput = ''; this.cursorIndex = 0;
+    let ended = false;
+    return () => {
+      if (ended) return; ended = true;
+      this.taskDepth--; this.interruptHandler = previous;
+      this.showPrompt();
+    };
+  }
 
   constructor() {
     this.term = new Terminal({
@@ -92,8 +109,8 @@ export class TerminalService {
     this.rawCommandHandler = handler;
   }
 
-  public write(text: string): void {
-    this.term.write(text);
+  public write(text: string, onConsumed?: () => void): void {
+    this.term.write(text, onConsumed);
   }
 
   public writeLine(text: string): void {
@@ -117,22 +134,24 @@ export class TerminalService {
   }
 
   public showPrompt(): void {
-    if (this.isRunningProgram) return;
+    if (this.isRunningProgram || this.commandBusy || this.taskDepth > 0) return;
     this.currentInput = '';
     this.cursorIndex = 0;
     const pathDisplay = this.currentDir ? `/workspace/${this.currentDir}` : '/workspace';
     this.term.write(`\r\n\x1b[1;32monlinecpp\x1b[0m:\x1b[1;34m${pathDisplay}\x1b[0m$ `);
   }
 
-  public startProgramExecution(name: string, stdinHandler?: (data: string) => void): void {
+  public startProgramExecution(name: string, stdinHandler?: (data: string) => void, interrupt?: () => void): void {
     this.isRunningProgram = true;
     this.programStdinCallback = stdinHandler || null;
+    if (interrupt) this.interruptHandler = interrupt;
     this.term.writeln(`\r\n\x1b[36m>>> [Executing: ${name}] <<<\x1b[0m`);
   }
 
   public endProgramExecution(exitCode: number, durationMs?: number): void {
     this.isRunningProgram = false;
     this.programStdinCallback = null;
+    if (!this.taskDepth) this.interruptHandler = null;
     const durStr = durationMs !== undefined ? ` (${durationMs.toFixed(1)}ms)` : '';
     const color = exitCode === 0 ? '\x1b[32m' : '\x1b[31m';
     this.term.writeln(`\r\n\x1b[90m----------------------------------------\x1b[0m`);
@@ -147,6 +166,13 @@ export class TerminalService {
 
   private setupKeyHandlers(): void {
     this.term.onData((data) => {
+      if ((this.isRunningProgram || this.commandBusy || this.taskDepth > 0) && data.includes('\x03')) {
+        this.term.write('^C\r\n');
+        if (this.interruptHandler) this.interruptHandler();
+        else this.programStdinCallback?.('\x03');
+        return;
+      }
+      if (!this.isRunningProgram && (this.commandBusy || this.taskDepth > 0)) return;
       // If a program is currently running interactively, forward data to its stdin!
       if (this.isRunningProgram) {
         // Strip bracketed paste mode sequences if present
@@ -160,7 +186,6 @@ export class TerminalService {
           if (this.programStdinCallback) {
             this.programStdinCallback('\x03');
           }
-          this.endProgramExecution(130);
           return;
         }
 
@@ -169,7 +194,9 @@ export class TerminalService {
         }
 
         // Echo characters locally for standard CLI interactions
-        if (cleanData === '\r' || cleanData === '\n') {
+        if (cleanData === '\x04') {
+          // EOF is a terminal control event, not a printable character.
+        } else if (cleanData === '\r' || cleanData === '\n') {
           this.term.write('\r\n');
         } else if (cleanData === '\x7f' || cleanData === '\b') {
           // Backspace
@@ -212,6 +239,7 @@ export class TerminalService {
             this.commandHistory.push(cmdLine);
             this.historyIndex = this.commandHistory.length;
             this.executeCommand(cmdLine);
+            if (this.commandBusy || this.isRunningProgram || this.taskDepth > 0) return;
           } else {
             this.showPrompt();
           }
@@ -371,12 +399,15 @@ export class TerminalService {
   }
 
   private async executeCommand(commandLine: string): Promise<void> {
+    if (this.commandBusy || this.taskDepth > 0 || this.isRunningProgram) return;
     const trimmed = commandLine.trim();
     if (!trimmed) {
       this.showPrompt();
       return;
     }
 
+    this.commandBusy = true;
+    try {
     if (this.rawCommandHandler) {
       try {
         await this.rawCommandHandler(trimmed);
@@ -397,8 +428,6 @@ export class TerminalService {
       this.term.writeln(`Command not recognized: ${trimmed}`);
     }
 
-    if (!this.isRunningProgram) {
-      this.showPrompt();
-    }
+    } finally { this.commandBusy = false; this.showPrompt(); }
   }
 }

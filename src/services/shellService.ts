@@ -19,6 +19,7 @@ export interface ShellContext {
   compileProject: () => Promise<void>;
   runProject: () => Promise<void>;
   runOnly?: () => Promise<void>;
+  runBinary?: (path: string, args: string[]) => Promise<void>;
   navigateRoute: (hash: string) => void;
 }
 
@@ -357,7 +358,9 @@ export class ShellService {
       default:
         if (cmd.startsWith('./') && (cmd.endsWith('.wasm') || cmd.endsWith('.out'))) {
           const target = this.resolvePath(cmd.slice(2));
-          await this.ctx.emceptionService.runWasmBinary(target);
+          if (this.ctx.runBinary) { await this.ctx.runBinary(target, args); break; }
+          await this.ctx.editorService.saveAllFiles();
+          await this.ctx.emceptionService.runWasmBinary(target, undefined, { cwd: this.ctx.terminalService.getCwd(), args });
           break;
         }
         stream.stderr(`Command not found: ${cmd}. Type "help" for a list of available commands.`);
@@ -672,9 +675,9 @@ export class ShellService {
         continue;
       }
 
-      try {
-        await this.ctx.fileSystem.deleteFile(resolved);
-        this.ctx.editorService.closeTab(resolved);
+        try {
+          await this.ctx.editorService.closeTabsUnder(resolved);
+          await this.ctx.fileSystem.deleteFile(resolved);
       } catch (e: any) {
         if (!force) {
           stream.stderr(`rm: cannot remove '${t}': ${e.message}`);
@@ -761,9 +764,10 @@ export class ShellService {
       resolvedDest = resolvedDest ? `${resolvedDest}/${srcName}` : srcName;
     }
 
-    try {
-      await this.ctx.fileSystem.move(resolvedSrc, resolvedDest);
-      this.ctx.editorService.closeTab(resolvedSrc);
+      try {
+        await this.ctx.editorService.closeTabsUnder(resolvedSrc);
+        await this.ctx.editorService.closeTabsUnder(resolvedDest);
+        await this.ctx.fileSystem.move(resolvedSrc, resolvedDest);
     } catch (err: any) {
       stream.stderr(`mv: failed to move '${src}' to '${dest}': ${err.message}`);
     }
@@ -1390,7 +1394,9 @@ export class ShellService {
       return;
     }
     const target = args[0] ? this.resolvePath(args[0]) : 'program.wasm';
-    await this.ctx.emceptionService.runWasmBinary(target);
+    if (this.ctx.runBinary) { await this.ctx.runBinary(target, args.slice(1)); return; }
+    await this.ctx.editorService.saveAllFiles();
+    await this.ctx.emceptionService.runWasmBinary(target, undefined, { cwd: this.ctx.terminalService.getCwd(), args: args.slice(1) });
   }
 
   private async execMode(args: string[], stream: CommandStream): Promise<void> {

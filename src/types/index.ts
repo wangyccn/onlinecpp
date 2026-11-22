@@ -29,6 +29,8 @@ export interface CompilerResult {
   stderr: string;
   outputPath?: string;
   wasmBytes?: Uint8Array;
+  /** Already-compiled module, reused by the runtime worker to skip a second compile. */
+  wasmModule?: WebAssembly.Module;
   durationMs: number;
 }
 
@@ -43,4 +45,5 @@ export interface EditorSettings {
   autoSave: boolean;
   wasmStorageMode: 'overwrite' | 'timestamp';
   buildMode: 'single' | 'project';
+  storageMode: 'disk' | 'browser';
 }

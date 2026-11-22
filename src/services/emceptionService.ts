@@ -1,6 +1,10 @@
-import { createEmception, BrowserEmceptionAPI, DEFAULT_MANIFEST_URL } from '@gameguild/emception-browser';
+import { DEFAULT_MANIFEST_URL } from '@gameguild/emception-browser';
 import { TerminalService } from './terminalService';
+import { FileSystemService } from './fileSystem';
 import { CompilerResult } from '../types';
+import { abortable } from './abort';
+import { localDependencies } from './localPaths';
+import { ProcessOutput } from './processOutput';
 
 // Standard Clang -cc1 and wasm-ld flags for Emception's in-browser C++ toolchain
 const CC1_FRONTEND = [
@@ -28,6 +32,7 @@ const CC1_CPP_INCLUDES = [
   '-internal-isystem', '/usr/include',
   '-I', '/home/user',
   '-I', '/home/user/include',
+  '-I', '/tmp/onlinecpp-include',
   '-I', '/home/user/default',
   '-I', '/home/user/default/include',
   '-I', '/',
@@ -163,47 +168,19 @@ const BITS_STDCPP_HEADER = `// C++ Universal Header <bits/stdc++.h> for WebAssem
 #endif // _BITS_STDCPP_H
 `;
 
-const ONLINECPP_RUNTIME_HEADER = `// Online C++ Studio Auto-Flushing & Unbuffered Runtime Support
-#pragma once
-#ifndef __ONLINECPP_RUNTIME_H__
-#define __ONLINECPP_RUNTIME_H__
-
+// Line buffered like a terminal; do not force an IO syscall for every character.
+const ONLINECPP_RUNTIME_HEADER = `#pragma once
 #include <stdio.h>
-
-#ifdef __cplusplus
-#include <iostream>
-
-struct __OnlineCppAutoFlusher {
-  __OnlineCppAutoFlusher() {
-    std::ios_base::sync_with_stdio(true);
-    std::cout.setf(std::ios_base::unitbuf);
-    std::cerr.setf(std::ios_base::unitbuf);
-  }
-  ~__OnlineCppAutoFlusher() {
-    std::cout.flush();
-    std::cerr.flush();
-    fflush(NULL);
-  }
-};
-static __OnlineCppAutoFlusher __onlinecpp_flusher_instance;
-#endif
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-static inline void __attribute__((constructor(101))) __onlinecpp_unbuffer_stdio(void) {
-  setvbuf(stdout, NULL, _IONBF, 0);
+static void __attribute__((constructor(101))) __onlinecpp_stdio(void) {
+  setvbuf(stdout, NULL, _IOLBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
 }
+`;
 
-static inline void __attribute__((destructor(101))) __onlinecpp_flush_stdio(void) {
-  fflush(NULL);
-}
-#ifdef __cplusplus
-}
-#endif
-
-#endif // __ONLINECPP_RUNTIME_H__
+// One precompiled header for the whole session: parsing libc++ costs more than
+// codegen for typical contest/assignment programs, and every TU pays it again.
+const PCH_SOURCE = '/tmp/onlinecpp-pch.h';
+const PCH_HEADER = `#include <bits/stdc++.h>
 `;
 
 const CC1_TAIL = [
@@ -219,14 +196,17 @@ const CC1_CPP_EXC = ['-fcxx-exceptions', '-fexceptions'];
 
 const WASM_LD_BASE = [
   '-L/usr/lib/emscripten/cache-lib/wasm32-emscripten',
-  '--entry=main',
+  '--no-entry',
+  '--export-if-defined=main',
+  '--export-if-defined=__main_argc_argv',
   '--import-undefined',
   '--allow-undefined',
   '--export-table',
   '--table-base=1',
   '--export=__wasm_call_ctors',
-  '--export-if-defined=fflush',
-  '--export-if-defined=exit',
+  '--export=fflush',
+  '--export-if-defined=__funcs_on_exit',
+  '--export=malloc',
   '--export-if-defined=__wasm_call_dtors',
 ];
 
@@ -239,750 +219,412 @@ const WASM_LD_CPP_LIBS = [
   '-lsockets',
 ];
 
+// Precompiled-header frontend: identical to the object frontend except the action.
+const PCH_FRONTEND = CC1_FRONTEND.map((arg) => (arg === '-emit-obj' ? '-emit-pch' : arg));
+
+type ToolResponse = { exitCode: number; stdout: string; stderr: string; readFiles?: Record<string, Uint8Array>; probes?: Record<string, 'file' | 'dir' | null>; files?: Record<string, Uint8Array> };
+type BuildRecord = { key: string; path: string; digest: string };
+type ObjectRecord = { path: string; dependencies: Record<string, string>; probes: Record<string, 'file' | 'dir' | null>; digest: string };
+const abortError = () => new DOMException('Task interrupted', 'AbortError');
+
 export class EmceptionService {
-  private em: BrowserEmceptionAPI | null = null;
-  private isInitializing = false;
-  private isReady = false;
-  private terminalService: TerminalService;
-  private lastCompiledWasm: Uint8Array | null = null;
+  private worker: Worker | null = null;
+  private runtime: Worker | null = null;
   private initPromise: Promise<boolean> | null = null;
-  private headersInstalled = false;
-  private syncedFilesCache: Map<string, string> = new Map();
+  private bootAbort: AbortController | null = null;
+  private ready = false;
+  private requestId = 0;
+  private pending = new Map<number, { resolve: (value: any) => void; reject: (error: any) => void }>();
+  private runtimeReject: ((error: any) => void) | null = null;
+  private objectCache = new Map<string, ObjectRecord>();
+  private lastBuild: BuildRecord | null = null;
+  private cacheDirReady = false;
+  private pchDisabled = false;
+  private pchPath: string | null = null;
+  private pchKey = '';
+  private pchPending: Promise<string | null> | null = null;
+  private pchPendingKey = '';
+  private lastModule: { path: string; module: WebAssembly.Module } | null = null;
+  private generation = 0;
+  private taskAbort: AbortController | null = null;
+  private stdout = new TextDecoder();
+  private stderr = new TextDecoder();
 
-  constructor(terminalService: TerminalService) {
-    this.terminalService = terminalService;
+  constructor(private terminalService: TerminalService, private fileSystem: FileSystemService) {}
+  public isCompilerReady(): boolean { return this.ready; }
+  public isBusy(): boolean { return this.taskAbort !== null; }
+  public resetWorkspace(): void {
+    this.stop(); this.lastBuild = null; this.objectCache.clear();
+    this.cacheDirReady = false; this.pchPath = null; this.pchKey = ''; this.pchDisabled = false; this.lastModule = null;
   }
 
-  public isCompilerReady(): boolean {
-    return this.isReady;
+  public stop(): void {
+    this.taskAbort?.abort(abortError());
+    this.bootAbort?.abort(); this.bootAbort = null;
+    this.generation++;
+    this.worker?.terminate(); this.worker = null;
+    this.fileSystem.io.disconnectCompiler();
+    this.runtime?.terminate(); this.runtime = null;
+    this.ready = false; this.initPromise = null;
+    this.cacheDirReady = false; this.pchPath = null; this.pchKey = ''; this.lastModule = null;
+    this.pchPending = null; this.pchPendingKey = '';
+    for (const request of this.pending.values()) request.reject(abortError());
+    this.pending.clear();
+    this.runtimeReject?.(abortError()); this.runtimeReject = null;
   }
 
-  public getLastCompiledWasm(): Uint8Array | null {
-    return this.lastCompiledWasm;
-  }
-
-  public setLastCompiledWasm(bytes: Uint8Array | null): void {
-    this.lastCompiledWasm = bytes;
-  }
-
-  public async readVfsFile(vfsPath: string): Promise<Uint8Array | null> {
-    if (!this.em) return null;
-    try {
-      const data = await this.em.workspace.readFile(vfsPath);
-      return data || null;
-    } catch {
-      return null;
-    }
+  private check(signal?: AbortSignal): void { signal?.throwIfAborted(); }
+  private rpc<T>(op: string, args: any = {}, transfer: Transferable[] = []): Promise<T> {
+    if (!this.worker) return Promise.reject(abortError());
+    const id = ++this.requestId;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.worker!.postMessage({ id, op, ...args }, transfer);
+    });
   }
 
   public async init(): Promise<boolean> {
-    if (this.isReady) return true;
+    if (this.ready) return true;
+    // Delay compiler boot until a folder is mounted; never create a persistent virtual workspace.
+    if (!this.fileSystem.hasOpenFolder()) return false;
     if (this.initPromise) return this.initPromise;
-
+    const generation = this.generation;
+    const bootAbort = this.bootAbort = new AbortController();
     this.initPromise = (async () => {
-      this.isInitializing = true;
-
       try {
-        console.log('[EmceptionService] Initializing Emception headless compiler toolchain...');
-
-        // In production (GitHub Pages / custom domain), directly use high-speed jsDelivr CDN manifest;
-        // only probe local dev middleware when running on localhost.
-        const isLocalDev = typeof window !== 'undefined' && (
-          window.location.hostname === 'localhost' ||
-          window.location.hostname === '127.0.0.1' ||
-          window.location.hostname === '0.0.0.0'
-        );
-
         let manifest = DEFAULT_MANIFEST_URL;
-        if (isLocalDev) {
-          try {
-            const testRes = await fetch('/emception-cdn/manifest.json', { method: 'HEAD' });
-            if (testRes.ok) {
-              manifest = '/emception-cdn/manifest.json';
-            }
-          } catch {
-            manifest = DEFAULT_MANIFEST_URL;
-          }
+        if (['localhost', '127.0.0.1', '0.0.0.0'].includes(location.hostname)) {
+          const probe = await fetch('/emception-cdn/manifest.json', { method: 'HEAD', signal: bootAbort.signal });
+          if (probe.ok) manifest = new URL('/emception-cdn/manifest.json', location.href).href;
         }
-
-        console.log('[EmceptionService] Using toolchain manifest:', manifest);
-
-        // Crucial: use tty: 'none' to avoid starting MiniShell or double-attaching to xterm
-        this.em = await createEmception({
-          tty: 'none',
-          manifestUrl: manifest,
-        });
-
-        this.isReady = true;
-        this.isInitializing = false;
-        await this.ensureStandardHeaders();
-        console.log('[EmceptionService] Emception toolchain ready!');
-        return true;
-      } catch (err: any) {
-        console.warn('[EmceptionService] createEmception failed:', err);
-        this.isInitializing = false;
-        return false;
+        bootAbort.signal.throwIfAborted();
+        const port = await this.fileSystem.io.connect();
+        if (generation !== this.generation) { port.close(); throw abortError(); }
+        const worker = this.worker = new Worker(new URL('../workers/toolchain.worker.ts', import.meta.url), { type: 'module' });
+        worker.onmessage = ({ data }) => {
+          if (generation !== this.generation) return;
+          if (data.type === 'output') { this.terminalService.write(data.text); return; }
+          const request = this.pending.get(data.id);
+          if (!request) return;
+          this.pending.delete(data.id);
+          if (data.error) request.reject(Object.assign(new Error(data.error.message), { name: data.error.name }));
+          else request.resolve(data.value);
+        };
+        worker.onerror = (event) => {
+          for (const request of this.pending.values()) request.reject(new Error(event.message));
+          this.pending.clear(); this.ready = false; this.initPromise = null;
+          worker.terminate(); if (this.worker === worker) this.worker = null;
+        };
+        await this.rpc('boot', { manifestUrl: manifest, libraries: WASM_LD_CPP_LIBS, port }, [port]);
+        await this.rpc('writeSupport', { files: {
+          '/tmp/onlinecpp-include/bits/stdc++.h': BITS_STDCPP_HEADER,
+          '/tmp/onlinecpp-runtime.h': ONLINECPP_RUNTIME_HEADER,
+          [PCH_SOURCE]: PCH_HEADER,
+        } });
+        if (generation !== this.generation) throw abortError();
+        this.ready = true; return true;
+      } catch (error: any) {
+        if (generation === this.generation) { this.ready = false; this.initPromise = null; }
+        if (error.name === 'AbortError') throw error;
+        console.error('[Compiler] Initialization failed', error); return false;
       }
     })();
-
     return this.initPromise;
   }
 
-  private async ensureStandardHeaders(): Promise<void> {
-    if (!this.em || this.headersInstalled) return;
-    const headerTasks = [
-      this.em.workspace.writeFile('/home/user/bits/stdc++.h', BITS_STDCPP_HEADER),
-      this.em.workspace.writeFile('/home/user/include/bits/stdc++.h', BITS_STDCPP_HEADER),
-      this.em.workspace.writeFile('/home/user/__onlinecpp_runtime.h', ONLINECPP_RUNTIME_HEADER),
-      this.em.workspace.writeFile('/home/user/include/__onlinecpp_runtime.h', ONLINECPP_RUNTIME_HEADER),
-    ];
-    await Promise.allSettled(headerTasks);
-    this.headersInstalled = true;
+  private async digest(text: string | Uint8Array): Promise<string> {
+    const bytes = await crypto.subtle.digest('SHA-256', (typeof text === 'string' ? new TextEncoder().encode(text) : text) as BufferSource);
+    return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
   }
 
-  public async syncFiles(
-    files: Record<string, string>,
-    forceFile?: string,
-    buildMode: 'single' | 'project' = 'single'
-  ): Promise<void> {
-    if (!this.em) return;
-
-    await this.ensureStandardHeaders();
-
-    const cleanForce = forceFile ? forceFile.replace(/^\/+/, '') : undefined;
-    const writeTasks: Promise<void>[] = [];
-    for (const [rawPath, content] of Object.entries(files)) {
-      const cleanPath = rawPath.replace(/^\/+/, '');
-      const isForced = cleanForce && cleanPath === cleanForce;
-
-      // In single file mode, skip syncing unrelated .cpp/.c files
-      if (buildMode === 'single' && !isForced) {
-        const isCppSource = /\.(cpp|cc|cxx|c)$/i.test(cleanPath);
-        if (isCppSource) {
-          continue;
-        }
-      }
-
-      if (!isForced && this.syncedFilesCache.get(cleanPath) === content) {
-        // Skip writing unchanged files
-        continue;
-      }
-      this.syncedFilesCache.set(cleanPath, content);
-
-      writeTasks.push(
-        (async () => {
-          try {
-            await this.em!.workspace.writeFile(`/home/user/${cleanPath}`, content);
-          } catch (e) {
-            console.warn(`[EmceptionService] Failed to sync ${cleanPath}:`, e);
-          }
-        })()
-      );
-    }
-
-    if (writeTasks.length > 0) {
-      await Promise.all(writeTasks);
-    }
+  private pchArgs(std: string, opt: string): string {
+    return this.cacheKeyArgs(std, opt).flat().join('\u0000');
   }
 
-  public async compile(
-    mainFile: string,
-    allFiles: Record<string, string>,
-    options: {
-      standard?: string;
-      optimization?: string;
-      buildMode?: 'single' | 'project';
-    } = {}
-  ): Promise<CompilerResult> {
-    const t0 = performance.now();
-    const std = options.standard || 'c++20';
-    // Use -O1 for fast in-browser builds and compact object files
-    const opt = (!options.optimization || options.optimization === '-O0') ? '-O1' : options.optimization;
-    const buildMode = options.buildMode || 'single';
-
-    const cleanMain = mainFile.replace(/^\/+/, '');
-    const modeLabel = buildMode === 'single' ? 'Single File Mode' : 'Project Mode';
-    this.terminalService.writeLine(`\r\n\x1b[33m[Compiler] Compiling ${cleanMain} (${std}, ${opt}, ${modeLabel})...\x1b[0m`);
-
-    // Ensure toolchain is ready
-    const ready = await this.init();
-
-    if (!ready || !this.em) {
-      const msg = `[Compiler Error] Emception toolchain could not be initialized.\nPlease ensure Cross-Origin Isolation headers are enabled.`;
-      this.terminalService.writeLine(`\x1b[31m${msg}\x1b[0m`);
-      return {
-        exitCode: 1,
-        stdout: '',
-        stderr: msg,
-        durationMs: performance.now() - t0,
-      };
-    }
-
-    // 1. Sync workspace files to VFS (in single mode, skips unrelated .cpp sources)
-    await this.syncFiles(allFiles, cleanMain, buildMode);
-
-    // 2. Determine sources to compile
-    let sourcesToCompile: string[];
-    if (buildMode === 'single') {
-      // In Single File Mode, compile ONLY the current file so each file can have its own main()!
-      sourcesToCompile = [cleanMain];
-    } else {
-      // In Project Mode, compile all C++ sources in the workspace
-      const cppSources = Object.keys(allFiles).filter((f) => {
-        const clean = f.replace(/^\/+/, '');
-        return clean.endsWith('.cpp') || clean.endsWith('.cc') || clean.endsWith('.cxx') || clean.endsWith('.c');
-      });
-      sourcesToCompile = cppSources.includes(cleanMain)
-        ? [cleanMain, ...cppSources.filter((s) => s !== cleanMain)]
-        : [cleanMain];
-    }
-
-    const objectPaths: string[] = [];
-    let stdoutTotal = '';
-    let stderrTotal = '';
-
-    const runOptions = {
-      cwd: '/home/user',
-      stdout: (data: Uint8Array | string) => {
-        const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
-        stdoutTotal += text;
-        this.terminalService.write(text);
-      },
-      stderr: (data: Uint8Array | string) => {
-        const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
-        stderrTotal += text;
-        this.terminalService.write(text);
-      },
-      onStdout: (text: string) => {
-        stdoutTotal += text;
-        this.terminalService.write(text);
-      },
-      onStderr: (text: string) => {
-        stderrTotal += text;
-        this.terminalService.write(text);
-      },
-    };
-
-    const stdFlag =
-      std === 'c++11' ? '-std=c++11' :
-      std === 'c++14' ? '-std=c++14' :
-      std === 'c++17' ? '-std=c++17' :
-      std === 'c++23' ? '-std=c++2c' :
-      '-std=c++20';
-
-    try {
-      // Step A: Compile each C++ source into an object file (.o)
-      for (const src of sourcesToCompile) {
-        const sourcePath = `/home/user/${src}`;
-        const objectPath = `/home/user/${src.replace(/[\/\\]/g, '_')}.o`;
-        objectPaths.push(objectPath);
-
-        const fileName = src.split('/').pop() || src;
-        const isCpp = !src.endsWith('.c');
-        const compileArgv = [
-          'clang',
-          ...CC1_FRONTEND,
-          ...CC1_CPP_INCLUDES,
-          stdFlag,
-          opt,
-          ...CC1_TAIL,
-          ...CC1_CPP_EXC,
-          '-include', '/home/user/__onlinecpp_runtime.h',
-          '-main-file-name', fileName,
-          '-o', objectPath,
-          '-x', isCpp ? 'c++' : 'c',
-          sourcePath,
-        ];
-
-        this.terminalService.writeLine(`\x1b[90m$ clang (cc1) -o ${fileName}.o ${fileName}\x1b[0m`);
-        const compileRes = await this.em.run('clang', compileArgv, runOptions);
-
-        if (compileRes.exitCode !== 0) {
-          this.lastCompiledWasm = null;
-          const durationMs = performance.now() - t0;
-          this.terminalService.writeLine(`\x1b[31m[Compiler] Compilation failed for ${src} with exit code ${compileRes.exitCode}\x1b[0m`);
-          return {
-            exitCode: compileRes.exitCode,
-            stdout: stdoutTotal,
-            stderr: stderrTotal || compileRes.stderr || '',
-            durationMs,
-          };
-        }
-      }
-
-      // Step B: Link all object files into program.wasm using wasm-ld
-      const wasmPath = '/home/user/program.wasm';
-      try {
-        await this.em.workspace.deleteFile(wasmPath);
-      } catch {
-        // ignore delete if not exists
-      }
-
-      const linkArgv = [
-        'wasm-ld',
-        ...objectPaths,
-        '-o', wasmPath,
-        ...WASM_LD_BASE,
-        ...WASM_LD_CPP_LIBS,
-      ];
-
-      this.terminalService.writeLine(`\x1b[90m$ wasm-ld -o program.wasm ${objectPaths.map((p) => p.split('/').pop()).join(' ')}\x1b[0m`);
-      const linkRes = await this.em.run('wasm-ld', linkArgv, runOptions);
-
-      const durationMs = performance.now() - t0;
-
-      if (linkRes.exitCode !== 0) {
-        this.lastCompiledWasm = null;
-        this.terminalService.writeLine(`\x1b[31m[Compiler] Linking failed with exit code ${linkRes.exitCode}\x1b[0m`);
-        return {
-          exitCode: linkRes.exitCode,
-          stdout: stdoutTotal,
-          stderr: stderrTotal || linkRes.stderr || '',
-          durationMs,
-        };
-      }
-
-      // Step C: Read the resulting WASM binary
-      let wasmBytes: Uint8Array | undefined;
-      try {
-        const raw = await this.em.workspace.readFile(wasmPath);
-        if (raw) {
-          wasmBytes = raw;
-          this.lastCompiledWasm = raw;
-        }
-      } catch (e) {
-        console.warn('[EmceptionService] Output binary could not be read from VFS:', e);
-      }
-
-      this.terminalService.writeLine(
-        `\x1b[32m[Compiler] Build successful in ${durationMs.toFixed(1)}ms! Binary generated: program.wasm\x1b[0m`
-      );
-
-      return {
-        exitCode: 0,
-        stdout: stdoutTotal,
-        stderr: stderrTotal,
-        outputPath: 'program.wasm',
-        wasmBytes,
-        durationMs,
-      };
-    } catch (err: any) {
-      const durationMs = performance.now() - t0;
-      this.terminalService.writeLine(`\x1b[31m[Compiler Error] ${err.message || String(err)}\x1b[0m`);
-      return {
-        exitCode: 1,
-        stdout: stdoutTotal,
-        stderr: err.message || String(err),
-        durationMs,
-      };
-    }
-  }
-
-  public async runWasmBinary(wasmName = 'program.wasm', wasmBytes?: Uint8Array): Promise<number> {
-    const t0 = performance.now();
-    const cleanWasmName = wasmName.split('/').pop()?.split('\\').pop() || 'program.wasm';
-    const bytesToRun = wasmBytes || this.lastCompiledWasm;
-
-    let lineBuffer = '';
-    const stdinQueue: number[] = [];
-    let pendingStdinResolver: ((byte: number | null) => void) | null = null;
-    let isProgramActive = true;
-
-    const pushByteToStdin = (byte: number) => {
-      if (pendingStdinResolver) {
-        const resolve = pendingStdinResolver;
-        pendingStdinResolver = null;
-        resolve(byte);
-      } else {
-        stdinQueue.push(byte);
-      }
-    };
-
-    const flushLine = () => {
-      const lineToFlush = lineBuffer + '\n';
-      lineBuffer = '';
-      const encoded = new TextEncoder().encode(lineToFlush);
-      for (let i = 0; i < encoded.length; i++) {
-        pushByteToStdin(encoded[i]);
-      }
-    };
-
-    // Connect terminal stdin to interactive buffer with line buffering & editing
-    this.terminalService.startProgramExecution(cleanWasmName, (input) => {
-      if (!isProgramActive) return;
-
-      // 1. Strip bracketed paste markers if present
-      const cleanInput = input.replace(/\x1b\[20[01]~/g, '');
-      if (!cleanInput) return;
-
-      // 2. Normalize all newlines (\r\n, \r, \n) to single standard \n
-      const normalized = cleanInput.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      const isMultiLine = normalized.includes('\n');
-
-      for (let i = 0; i < normalized.length; i++) {
-        const char = normalized[i];
-        const code = normalized.charCodeAt(i);
-
-        if (code === 3) {
-          // Ctrl+C - interrupt
-          if (pendingStdinResolver) {
-            const resolve = pendingStdinResolver;
-            pendingStdinResolver = null;
-            resolve(-1);
-          }
-          return;
-        }
-
-        if (code === 4) {
-          // Ctrl+D - EOF
-          if (lineBuffer.length > 0) {
-            flushLine();
-          }
-          pushByteToStdin(-1);
-          return;
-        }
-
-        if (char === '\n') {
-          flushLine();
-        } else if (code === 127 || code === 8) {
-          // Backspace
-          if (lineBuffer.length > 0) {
-            lineBuffer = lineBuffer.slice(0, -1);
-          }
-        } else if (code >= 32 || char === '\t') {
-          lineBuffer += char;
-        }
-      }
-
-      // If user pasted a multi-line test case and the last line didn't end with a newline,
-      // auto-flush it so the competitive programming problem immediately receives all input!
-      if (isMultiLine && lineBuffer.length > 0) {
-        flushLine();
-      }
-    });
-
-    const stdinFn = (): Promise<number | null> | number => {
-      if (stdinQueue.length > 0) {
-        return stdinQueue.shift()!;
-      }
-      return new Promise<number | null>((resolve) => {
-        pendingStdinResolver = resolve;
-      });
-    };
-
-    try {
-      // 1. Primary execution via Emception Worker (supports real-time stdin via SharedArrayBuffer & Atomics.wait)
-      const ready = await this.init();
-      if (ready && this.em) {
-        const vfsWasmPath = `/home/user/${cleanWasmName}`;
-        if (bytesToRun) {
-          try {
-            await this.em.workspace.writeFile(vfsWasmPath, bytesToRun);
-            if (cleanWasmName !== 'program.wasm') {
-              await this.em.workspace.writeFile('/home/user/program.wasm', bytesToRun);
-            }
-          } catch (e) {
-            console.warn('[EmceptionService] Write wasm to VFS warning:', e);
-          }
-        }
-
-        const runOptions = {
-          cwd: '/home/user',
-          stdin: stdinFn,
-          stdout: (data: Uint8Array | string) => {
-            const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
-            this.terminalService.write(text);
-          },
-          stderr: (data: Uint8Array | string) => {
-            const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
-            this.terminalService.write(text);
-          },
-          onStdout: (text: string) => {
-            this.terminalService.write(text);
-          },
-          onStderr: (text: string) => {
-            this.terminalService.write(text);
-          },
-        };
-
-        try {
-          const result = await this.em.run('wasi-run', ['wasi-run', vfsWasmPath], runOptions);
-          const durationMs = performance.now() - t0;
-          this.terminalService.endProgramExecution(result.exitCode, durationMs);
-          return result.exitCode;
-        } catch (workerErr: any) {
-          console.warn('[EmceptionService] Worker wasi-run execution failed, falling back to browser WASI runtime:', workerErr);
-          if (bytesToRun) {
-            const exitCode = await this.runWithBrowserWasi(bytesToRun);
-            this.terminalService.endProgramExecution(exitCode, performance.now() - t0);
-            return exitCode;
-          }
-          throw workerErr;
-        }
-      }
-
-      // 2. Fallback execution via Browser Main-Thread WASI
-      if (bytesToRun) {
-        const exitCode = await this.runWithBrowserWasi(bytesToRun);
-        this.terminalService.endProgramExecution(exitCode, performance.now() - t0);
-        return exitCode;
-      }
-
-      this.terminalService.writeLine('\x1b[31mNo compiled WebAssembly binary found to execute.\x1b[0m');
-      this.terminalService.endProgramExecution(1, performance.now() - t0);
-      return 1;
-    } catch (e: any) {
-      this.terminalService.writeLine(`\x1b[31mRuntime execution error: ${e.message || String(e)}\x1b[0m`);
-      this.terminalService.endProgramExecution(1, performance.now() - t0);
-      return 1;
-    } finally {
-      isProgramActive = false;
-      if (pendingStdinResolver) {
-        const resolve = pendingStdinResolver;
-        pendingStdinResolver = null;
-        resolve(null);
-      }
-    }
-  }
-
-  private pendingStdinBuffer: number[] = [];
-
-  private feedStdin(data: string): void {
-    for (let i = 0; i < data.length; i++) {
-      this.pendingStdinBuffer.push(data.charCodeAt(i));
-    }
+  private cacheKeyArgs(std: string, opt: string): (string | string[])[] {
+    return ['native-cache-v3', DEFAULT_MANIFEST_URL, std, opt, CC1_FRONTEND, CC1_CPP_INCLUDES, CC1_TAIL, CC1_CPP_EXC, ONLINECPP_RUNTIME_HEADER, BITS_STDCPP_HEADER];
   }
 
   /**
-   * High performance, browser WASI runtime that executes the compiled WebAssembly
-   * module with stdin/stdout mapped directly to xterm!
+   * Build (once per toolchain/std/opt combination) a precompiled header for the
+   * universal <bits/stdc++.h>. Parsing libc++ dominates compile time for small
+   * programs, so this turns a multi-second header walk into one deserialisation.
+   * Any failure silently falls back to plain header parsing.
    */
-  private async runWithBrowserWasi(wasmBytes: Uint8Array): Promise<number> {
-    let exitCode = 0;
-    const utf8Decoder = new TextDecoder('utf-8');
-    const utf8Encoder = new TextEncoder();
-    let memory: WebAssembly.Memory | undefined;
+  private async ensurePch(std: string, opt: string): Promise<string | null> {
+    if (this.pchDisabled) return null;
+    const key = await this.digest(this.pchArgs(std, opt) + '\u0000pch-v1');
+    if (this.pchKey === key && this.pchPath) return this.pchPath;
+    // A warm-up may already be building this exact header; share that work.
+    if (this.pchPending && this.pchPendingKey === key) return this.pchPending;
+    const rel = `.onlinecpp/cache/pch-${key}.pch`;
+    const abs = '/home/user/' + rel;
+    const pending = (async (): Promise<string | null> => {
+      try {
+        if (!this.cacheDirReady) { await this.fileSystem.createDirectory('.onlinecpp/cache'); this.cacheDirReady = true; }
+        if (await this.fileSystem.fileExists(rel)) { this.pchKey = key; this.pchPath = abs; return abs; }
+        this.terminalService.writeLine('\x1b[90m[Cache] Precompiling <bits/stdc++.h> once — later builds reuse it\x1b[0m');
+        const result = await this.rpc<ToolResponse>('run', { tool: 'clang', capture: [abs], argv: [
+          'clang', ...PCH_FRONTEND, ...CC1_CPP_INCLUDES, `-std=${std}`, opt, ...CC1_TAIL, ...CC1_CPP_EXC,
+          '-o', abs, '-x', 'c++-header', PCH_SOURCE,
+        ] });
+        if (result.exitCode !== 0) { this.pchDisabled = true; return null; }
+        const bytes = result.files?.[abs];
+        if (!bytes || bytes.length < 4096) { this.pchDisabled = true; return null; }
+        await this.fileSystem.writeBinaryFile(rel, bytes);
+        this.pchKey = key; this.pchPath = abs;
+        return abs;
+      } catch (error: any) {
+        if (error.name === 'AbortError') throw error;
+        this.pchDisabled = true; return null;
+      }
+    })();
+    this.pchPending = pending; this.pchPendingKey = key;
+    try { return await pending; }
+    finally { if (this.pchPending === pending) { this.pchPending = null; this.pchPendingKey = ''; } }
+  }
 
-    const wasiSnapshotPreview1 = {
-      proc_exit: (rval: number) => {
-        exitCode = rval;
-        throw new Error(`__WASI_EXIT_${rval}__`);
-      },
-      fd_write: (fd: number, iovs: number, iovsLen: number, nwritten: number) => {
-        if (!memory) return 8; // EBADF
-        const mem = new DataView(memory.buffer);
-        let written = 0;
-        let str = '';
+  /** Download + boot the toolchain and precompile headers before the first build. */
+  public async prepare(standard: string, optimization: string): Promise<boolean> {
+    const ready = await this.init();
+    if (!ready) return false;
+    try { await this.ensurePch(standard, optimization); } catch { /* PCH is optional. */ }
+    return true;
+  }
 
-        for (let i = 0; i < iovsLen; i++) {
-          const ptr = mem.getUint32(iovs + i * 8, true);
-          const len = mem.getUint32(iovs + i * 8 + 4, true);
-          const buf = new Uint8Array(memory.buffer, ptr, len);
-          str += utf8Decoder.decode(buf, { stream: true });
-          written += len;
-        }
-
-        mem.setUint32(nwritten, written, true);
-
-        if (fd === 1 || fd === 2) {
-          this.terminalService.write(str);
-        }
-        return 0;
-      },
-      fd_read: (fd: number, iovs: number, iovsLen: number, nread: number) => {
-        if (!memory) return 8;
-        const mem = new DataView(memory.buffer);
-        let totalRead = 0;
-
-        if (fd !== 0) {
-          mem.setUint32(nread, 0, true);
-          return 8;
-        }
-
-        // If stdin buffer is empty in synchronous fallback, prompt user so std::cin does not immediately hit EOF
-        if (this.pendingStdinBuffer.length === 0 && typeof window !== 'undefined' && window.prompt) {
-          const input = window.prompt('[C++ cin] Program requested input:');
-          if (input !== null) {
-            this.feedStdin(input + '\n');
-            this.terminalService.writeLine(input);
-          }
-        }
-
-        for (let i = 0; i < iovsLen; i++) {
-          const ptr = mem.getUint32(iovs + i * 8, true);
-          const len = mem.getUint32(iovs + i * 8 + 4, true);
-          const dest = new Uint8Array(memory.buffer, ptr, len);
-
-          let bytesToCopy = Math.min(len, this.pendingStdinBuffer.length);
-          for (let b = 0; b < bytesToCopy; b++) {
-            dest[b] = this.pendingStdinBuffer.shift()!;
-          }
-          totalRead += bytesToCopy;
-          if (bytesToCopy === 0) break;
-        }
-
-        mem.setUint32(nread, totalRead, true);
-        return 0;
-      },
-      fd_close: () => 0,
-      fd_seek: () => 8, // EBADF (streams not seekable)
-      fd_fdstat_get: (fd: number, stat: number) => {
-        if (!memory) return 8;
-        const mem = new DataView(memory.buffer);
-        mem.setUint8(stat, fd <= 2 ? 2 : 4); // character device vs regular file
-        mem.setUint16(stat + 2, 0, true); // fs_flags
-        let rights = BigInt(0);
-        if (fd === 0) rights = BigInt(0x2); // FD_READ
-        else if (fd === 1 || fd === 2) rights = BigInt(0x40); // FD_WRITE
-        mem.setBigUint64(stat + 8, rights, true);
-        mem.setBigUint64(stat + 16, BigInt(0), true);
-        return 0;
-      },
-      fd_fdstat_set_flags: () => 0,
-      fd_prestat_get: () => 8,
-      fd_prestat_dir_name: () => 8,
-      environ_sizes_get: (environCount: number, environBufSize: number) => {
-        if (!memory) return 8;
-        const mem = new DataView(memory.buffer);
-        mem.setUint32(environCount, 0, true);
-        mem.setUint32(environBufSize, 0, true);
-        return 0;
-      },
-      environ_get: () => 0,
-      args_sizes_get: (argc: number, argvBufSize: number) => {
-        if (!memory) return 8;
-        const mem = new DataView(memory.buffer);
-        mem.setUint32(argc, 1, true);
-        mem.setUint32(argvBufSize, 8, true); // "program\0"
-        return 0;
-      },
-      args_get: (argv: number, argvBuf: number) => {
-        if (!memory) return 8;
-        const mem = new DataView(memory.buffer);
-        mem.setUint32(argv, argvBuf, true);
-        const nameBytes = utf8Encoder.encode('program\0');
-        new Uint8Array(memory.buffer, argvBuf, nameBytes.length).set(nameBytes);
-        return 0;
-      },
-      clock_time_get: (_id: number, _precision: bigint, timeOut: number) => {
-        if (!memory) return 8;
-        const mem = new DataView(memory.buffer);
-        const nowNs = BigInt(Math.floor(performance.now() * 1_000_000));
-        mem.setBigUint64(timeOut, nowNs, true);
-        return 0;
-      },
-      random_get: (buf: number, bufLen: number) => {
-        if (!memory) return 8;
-        const bytes = new Uint8Array(memory.buffer, buf, bufLen);
-        crypto.getRandomValues(bytes);
-        return 0;
-      },
-      poll_oneoff: (inPtr: number, outPtr: number, nsubscriptions: number, neventsPtr: number) => {
-        if (!memory) return 8;
-        const mem = new DataView(memory.buffer);
-        const SUB_SIZE = 48;
-        const EVT_SIZE = 32;
-        let nevents = 0;
-        for (let i = 0; i < nsubscriptions; i++) {
-          const subPtr = inPtr + i * SUB_SIZE;
-          const evPtr = outPtr + nevents * EVT_SIZE;
-          const userdata = mem.getBigUint64(subPtr, true);
-          const eventType = mem.getUint8(subPtr + 8);
-          mem.setBigUint64(evPtr, userdata, true);
-          mem.setUint16(evPtr + 8, 0, true);
-          mem.setUint8(evPtr + 10, eventType);
-          mem.setBigUint64(evPtr + 16, BigInt(1), true);
-          mem.setUint16(evPtr + 24, 0, true);
-          nevents++;
-        }
-        mem.setUint32(neventsPtr, nevents, true);
-        return 0;
-      },
-      sched_yield: () => 0,
-      path_open: () => 44, // ENOENT
-      path_filestat_get: () => 44,
-    };
-
+  public async compile(mainFile: string, allFiles: Record<string, string>, options: {
+    standard?: string; optimization?: string; buildMode?: 'single' | 'project'; outputPath?: string; signal?: AbortSignal;
+  } = {}): Promise<CompilerResult> {
+    if (this.isBusy()) throw new Error('A compiler or program is already running');
+    const controller = this.taskAbort = new AbortController();
+    const t0 = performance.now(), signal = controller.signal;
+    const wait = <T>(promise: Promise<T>) => abortable(promise, signal);
+    const std = options.standard || 'c++20', opt = options.optimization || '-O0';
+    const outputPath = options.outputPath || mainFile.replace(/\.[^/.]+$/, '') + '.wasm';
+    const main = mainFile.replace(/^\/+/, '');
+    const sources = options.buildMode === 'project' ? [main, ...Object.keys(allFiles).filter((path) => path !== main && /\.(c|cc|cpp|cxx)$/i.test(path))].sort() : [main];
+    const onAbort = () => this.stop();
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) controller.abort(abortError());
+    let stdout = '', stderr = '';
+    this.terminalService.writeLine(`\r\n\x1b[33m[Compiler] ${main} (${std}, ${opt}) — Ctrl+C to interrupt\x1b[0m`);
     try {
-      const cleanBuffer = new ArrayBuffer(wasmBytes.byteLength);
-      new Uint8Array(cleanBuffer).set(wasmBytes);
-      const wasmModule = await WebAssembly.compile(cleanBuffer);
-
-      // Dynamically fulfill imports required by the compiled binary
-      const importDescs = WebAssembly.Module.imports(wasmModule);
-      const importObject: Record<string, Record<string, any>> = {};
-
-      for (const imp of importDescs) {
-        if (!importObject[imp.module]) {
-          importObject[imp.module] = {};
+      this.check(signal);
+      if (!await wait(this.init())) throw new Error('Compiler could not initialize. Check cross-origin isolation and toolchain downloads.');
+      this.check(signal);
+      if (!this.cacheDirReady) { await wait(this.fileSystem.createDirectory('.onlinecpp/cache')); this.cacheDirReady = true; }
+      const commonKey = await wait(this.digest(JSON.stringify(this.cacheKeyArgs(std, opt))));
+      // Resolve the PCH before touching the toolchain so a warm-up in flight finishes
+      // first instead of racing this build inside the same worker.
+      let pch = sources.some((source) => !source.endsWith('.c')) ? await wait(this.ensurePch(std, opt)) : null;
+      this.check(signal);
+      await wait(this.rpc('setInputs', { files: allFiles }));
+      const paths: string[] = [], keys: string[] = [];
+      const digests = new Map<string, Promise<string>>();
+      const dependencyDigest = (path: string): Promise<string> => {
+        if (!digests.has(path)) digests.set(path, (async () => this.digest(allFiles[path] ?? await wait(this.fileSystem.readBinaryFile(path))))());
+        return wait(digests.get(path)!);
+      };
+      for (const source of sources) {
+        this.check(signal);
+        const key = await wait(this.digest(commonKey + source + await dependencyDigest(source)));
+        const object = `.onlinecpp/cache/${key}.o`; paths.push('/home/user/' + object);
+        let previous = this.objectCache.get(key);
+        if (!previous) {
+          try {
+            const metadata = JSON.parse(await wait(this.fileSystem.readFile(object + '.json')));
+            if (metadata.key === key && metadata.dependencies && metadata.probes && typeof metadata.digest === 'string' && Object.values(metadata.dependencies).every((value) => typeof value === 'string')) {
+              previous = { path: object, dependencies: metadata.dependencies, probes: metadata.probes, digest: metadata.digest }; this.objectCache.set(key, previous);
+            }
+          } catch (error: any) { if (error.name === 'AbortError') throw error; /* Missing/corrupt metadata is a cache miss. */ }
         }
-
-        if (imp.module === 'wasi_snapshot_preview1' || imp.module === 'wasi_unstable') {
-          importObject[imp.module][imp.name] = (wasiSnapshotPreview1 as any)[imp.name] || (() => 0);
-        } else if (imp.kind === 'memory') {
-          const mem = new WebAssembly.Memory({ initial: 256, maximum: 16384 });
-          importObject[imp.module][imp.name] = mem;
-          memory = mem;
-        } else if (imp.kind === 'table') {
-          importObject[imp.module][imp.name] = new WebAssembly.Table({
-            initial: 0,
-            element: 'anyfunc',
-          });
-        } else {
-          importObject[imp.module][imp.name] = () => 0;
+        let valid = !!previous && await wait(this.fileSystem.fileExists(object));
+        if (valid) {
+          const probes = Object.keys(previous!.probes).filter((path) => !(path in previous!.dependencies));
+          const current = await wait(this.fileSystem.io.request<Record<string, string | null>>('statMany', '', probes));
+          valid = probes.every((path) => current[path] === previous!.probes[path]);
         }
+        if (valid) {
+          for (const [path, digest] of Object.entries(previous!.dependencies)) {
+            try { if (await dependencyDigest(path) !== digest) { valid = false; break; } }
+            catch (error: any) { if (error.name === 'AbortError') throw error; valid = false; break; }
+          }
+        }
+        if (valid) {
+          keys.push(previous!.digest);
+          this.terminalService.writeLine(`\x1b[90m[Cache] ${source} unchanged; skipping clang\x1b[0m`); continue;
+        }
+        // Unique process output avoids stale Emscripten mapping tails. Publish only successful objects.
+        const scratch = `.onlinecpp/cache/${crypto.randomUUID()}`;
+        const cpp = !source.endsWith('.c');
+        const objectFile = `/home/user/${scratch}.o`, depFile = `/home/user/${scratch}.d`;
+        const clangArgv = (precompiled: string | null) => [
+          'clang', ...CC1_FRONTEND, ...CC1_CPP_INCLUDES,
+          cpp ? `-std=${std}` : '-std=c17', opt, ...CC1_TAIL,
+          ...(cpp ? CC1_CPP_EXC : []),
+          ...(precompiled ? ['-include-pch', precompiled] : []), '-include', '/tmp/onlinecpp-runtime.h',
+          '-dependency-file', depFile, '-MT', 'object',
+          '-o', objectFile, '-x', cpp ? 'c++' : 'c', `/home/user/${source}`,
+        ];
+        const runClang = (precompiled: string | null) => wait(this.rpc<ToolResponse>('run', { tool: 'clang', capture: [objectFile, depFile], argv: clangArgv(precompiled) }));
+        let result = await runClang(pch);
+        if (result.exitCode !== 0 && cpp && pch) {
+          // An unusual translation unit can reject the PCH (macro state before the first
+          // include). Retry once without it and stop using PCH for the rest of the session.
+          pch = null; this.pchDisabled = true;
+          this.terminalService.writeLine('\x1b[90m[Cache] Precompiled header rejected; falling back to header parsing\x1b[0m');
+          result = await runClang(null);
+        }
+        stdout += result.stdout || ''; stderr += result.stderr || '';
+        this.check(signal);
+        if (result.exitCode !== 0) return { ...result, stdout, stderr, durationMs: performance.now() - t0 };
+        const dependencies: Record<string, string> = {};
+        const depfile = result.files?.[depFile]
+          ? new TextDecoder().decode(result.files[depFile])
+          : await wait(this.fileSystem.readFile(scratch + '.d'));
+        for (const path of localDependencies(depfile)) {
+          if (path.startsWith('.onlinecpp/')) continue;
+          dependencies[path] = result.readFiles?.[path] ? await wait(this.digest(result.readFiles[path])) : await dependencyDigest(path);
+        }
+        const objectBytes = result.files?.[objectFile] ?? await wait(this.fileSystem.readBinaryFile(scratch + '.o'));
+        const digest = await wait(this.digest(objectBytes)), probes = result.probes || {};
+        await wait(Promise.all([
+          this.fileSystem.writeBinaryFile(object, objectBytes),
+          this.fileSystem.writeFile(object + '.json', JSON.stringify({ key, dependencies, probes, digest })),
+        ]));
+        this.objectCache.set(key, { path: object, dependencies, probes, digest });
+        keys.push(digest);
       }
-
-      const instance = await WebAssembly.instantiate(wasmModule, importObject);
-
-      // If module exported memory, capture it
-      if (!memory && (instance.exports.memory as any) instanceof WebAssembly.Memory) {
-        memory = instance.exports.memory as WebAssembly.Memory;
-      }
-
-      // Call global constructors if present
-      const initFn = instance.exports.__wasm_call_ctors as Function;
-      if (typeof initFn === 'function') {
+      this.check(signal);
+      const linkKey = await wait(this.digest(JSON.stringify([keys, WASM_LD_BASE, WASM_LD_CPP_LIBS])));
+      const linkMetadata = `.onlinecpp/cache/link-${linkKey}.json`;
+      if (this.lastBuild?.key !== linkKey) {
         try {
-          initFn();
-        } catch {
-          // constructor init ignore
+          const saved = JSON.parse(await wait(this.fileSystem.readFile(linkMetadata)));
+          if (saved.key === linkKey && typeof saved.path === 'string' && typeof saved.digest === 'string') this.lastBuild = saved;
+        } catch (error: any) { if (error.name === 'AbortError') throw error; }
+      }
+      if (this.lastBuild?.key === linkKey && await wait(this.fileSystem.fileExists(this.lastBuild.path))) {
+        const wasmBytes = await wait(this.fileSystem.readBinaryFile(this.lastBuild.path));
+        if (await wait(this.digest(wasmBytes)) === this.lastBuild.digest) {
+          if (this.lastBuild.path !== outputPath) {
+            await wait(this.fileSystem.writeBinaryFile(outputPath, wasmBytes));
+            this.lastBuild = { ...this.lastBuild, path: outputPath };
+            await wait(this.fileSystem.writeFile(linkMetadata, JSON.stringify(this.lastBuild)));
+          }
+          this.terminalService.writeLine('\x1b[32m[Cache] Build unchanged; skipping linker\x1b[0m');
+          return { exitCode: 0, stdout, stderr, outputPath, wasmBytes, durationMs: performance.now() - t0 };
         }
       }
+      const scratch = `.onlinecpp/cache/${crypto.randomUUID()}.wasm`;
+      const linkOut = '/home/user/' + scratch;
+      const result = await wait(this.rpc<ToolResponse>('run', { tool: 'wasm-ld', capture: [linkOut], argv: ['wasm-ld', ...paths, '-o', linkOut, ...WASM_LD_BASE, ...WASM_LD_CPP_LIBS] }));
+      stdout += result.stdout || ''; stderr += result.stderr || ''; this.check(signal);
+      if (result.exitCode !== 0) return { ...result, stdout, stderr, durationMs: performance.now() - t0 };
+      const wasmBytes = result.files?.[linkOut] ?? await wait(this.fileSystem.readBinaryFile(scratch));
+      if (!wasmBytes?.length) throw new Error('Linker produced no output');
+      // Compiling once here also proves the module is valid, and the runtime worker
+      // reuses this exact module instead of compiling the bytes a second time.
+      const module = await wait(WebAssembly.compile(wasmBytes as BufferSource));
+      const exports = WebAssembly.Module.exports(module);
+      if (!exports.some((item) => ['main', '__main_argc_argv', '_start'].includes(item.name))) throw new Error('Program entry point missing: define main()');
+      await wait(this.fileSystem.writeBinaryFile(outputPath, wasmBytes)); this.check(signal);
+      this.lastBuild = { key: linkKey, path: outputPath, digest: await wait(this.digest(wasmBytes)) };
+      this.lastModule = { path: outputPath, module };
+      await wait(this.fileSystem.writeFile(linkMetadata, JSON.stringify(this.lastBuild)));
+      const durationMs = performance.now() - t0;
+      this.terminalService.writeLine(`\x1b[32m[Compiler] Build successful in ${durationMs.toFixed(1)}ms → ${outputPath} (IndexedDB committed${this.fileSystem.getStorageMode() === 'disk' ? ', disk sync queued' : ', browser storage only'})\x1b[0m`);
+      return { exitCode: 0, stdout, stderr, outputPath, wasmBytes, wasmModule: module, durationMs };
+    } catch (error: any) {
+      const cancelled = signal?.aborted || error.name === 'AbortError';
+      const message = cancelled ? 'Build interrupted' : error.message || String(error);
+      this.terminalService.writeLine(`\x1b[${cancelled ? 33 : 31}m[Compiler] ${message}\x1b[0m`);
+      return { exitCode: cancelled ? 130 : 1, stdout, stderr: message, durationMs: performance.now() - t0 };
+    } finally { options.signal?.removeEventListener('abort', onAbort); this.taskAbort = null; }
+  }
 
-      // Execute entrypoint
-      const start = (instance.exports._start || instance.exports.main) as Function;
-      if (typeof start === 'function') {
-        const result = start(0, 0);
-        if (result && typeof result.then === 'function') {
-          await result;
-        } else if (typeof result === 'number') {
-          exitCode = result;
+  public async runWasmBinary(name = 'program.wasm', bytes?: Uint8Array, options: { signal?: AbortSignal; cwd?: string; args?: string[]; module?: WebAssembly.Module } = {}): Promise<number> {
+    if (this.isBusy()) throw new Error('A compiler or program is already running');
+    const controller = this.taskAbort = new AbortController();
+    const t0 = performance.now();
+    const signal = controller.signal;
+    const onAbort = () => controller.abort(abortError());
+    const wait = <T>(promise: Promise<T>) => abortable(promise, signal);
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+    const release = this.terminalService.beginTask(onAbort);
+    let control: Int32Array | undefined;
+    let code = 1, line = '', eof = false;
+    const queued: number[] = []; let queueHead = 0;
+    let pumpTimer: ReturnType<typeof setTimeout> | undefined;
+    let outputTimer: ReturnType<typeof setInterval> | undefined;
+    let drainOutput = () => {};
+    try {
+      this.check(signal);
+      // Reuse an already-compiled module when the caller does not supply one, so a
+      // repeated "Run" on an unchanged build skips WebAssembly compilation entirely.
+      const module = options.module ?? (bytes ? undefined : (this.lastModule?.path === name ? this.lastModule.module : undefined));
+      if (!module) bytes ||= await wait(this.fileSystem.readBinaryFile(name));
+      await wait(this.fileSystem.io.finishRuntime());
+      const port = await wait(this.fileSystem.io.connect('runtime')); this.check(signal);
+      control = new Int32Array(new SharedArrayBuffer(12));
+      const data = new Uint8Array(new SharedArrayBuffer(65536));
+      const pump = () => {
+        while (queueHead < queued.length) {
+          const write = Atomics.load(control!, 1), next = (write + 1) % data.length;
+          if (next === Atomics.load(control!, 0)) break;
+          data[write] = queued[queueHead++]; Atomics.store(control!, 1, next);
         }
-      }
-
-      // Flush all standard streams and run destructors on program exit
-      if (typeof (instance.exports.fflush as any) === 'function') {
-        try {
-          (instance.exports.fflush as any)(0);
-        } catch {
-          // ignore
+        Atomics.notify(control!, 1);
+        if (queueHead < queued.length) pumpTimer = setTimeout(pump, 4);
+        else { queued.length = 0; queueHead = 0; if (eof) { Atomics.store(control!, 2, 1); Atomics.notify(control!, 1); } }
+      };
+      const feed = (text: string) => { for (const byte of new TextEncoder().encode(text)) queued.push(byte); clearTimeout(pumpTimer); pump(); };
+      this.terminalService.startProgramExecution(name, (input) => {
+        const normalized = input.replace(/\x1b\[20[01]~/g, '').replace(/\r\n|\r/g, '\n');
+        for (const char of normalized) {
+          if (char === '\x03') { onAbort(); return; }
+          if (char === '\x04') { if (line) { feed(line); line = ''; } else { eof = true; pump(); } return; }
+          if (char === '\n') { feed(line + '\n'); line = ''; }
+          else if (char === '\x7f' || char === '\b') line = line.slice(0, -1);
+          else if (char >= ' ' || char === '\t') line += char;
         }
-      }
-      if (typeof (instance.exports.__wasm_call_dtors as any) === 'function') {
-        try {
-          (instance.exports.__wasm_call_dtors as any)();
-        } catch {
-          // ignore
-        }
-      }
-
-      return exitCode;
-    } catch (e: any) {
-      if (e.message && e.message.startsWith('__WASI_EXIT_')) {
-        return exitCode;
-      }
-      throw e;
+        if (normalized.includes('\n') && line) { feed(line + '\n'); line = ''; }
+      }, onAbort);
+      const runtime = this.runtime = new Worker(new URL('../workers/runtime.worker.ts', import.meta.url), { type: 'module' });
+      const output = new ProcessOutput();
+      this.stdout = new TextDecoder(); this.stderr = new TextDecoder();
+      drainOutput = () => {
+        const { chunks, end } = output.read();
+        if (!chunks.length) return;
+        const text = chunks.map((chunk) => (chunk.stream === 2 ? this.stderr : this.stdout).decode(chunk.bytes, { stream: true })).join('');
+        this.terminalService.write(text, () => output.acknowledge(end));
+      };
+      outputTimer = setInterval(drainOutput, 8);
+      code = await wait(new Promise<number>((resolve, reject) => {
+        this.runtimeReject = reject;
+        runtime.onerror = (event) => reject(new Error(event.message));
+        runtime.onmessage = ({ data }) => {
+          if (data.type === 'exit') resolve(data.code);
+          else if (data.type === 'error') reject(new Error(data.message));
+        };
+        runtime.postMessage({ bytes, module, port, stdinControl: control!.buffer, stdinData: data.buffer, output: output.shared, cwd: options.cwd || '', args: options.args || [], program: name }, [port]);
+      }));
+    } catch (error: any) {
+      code = signal?.aborted || error.name === 'AbortError' ? 130 : 1;
+      if (code !== 130) this.terminalService.writeLine(`\x1b[31mRuntime error: ${error.message || error}\x1b[0m`);
+    } finally {
+      this.runtime?.terminate(); this.runtime = null; this.runtimeReject = null;
+      clearInterval(outputTimer); drainOutput();
+      const finalText = this.stdout.decode() + this.stderr.decode();
+      if (finalText) this.terminalService.write(finalText);
+      clearTimeout(pumpTimer); if (control) { Atomics.store(control, 2, 1); Atomics.notify(control, 1); }
+      options.signal?.removeEventListener('abort', onAbort);
+      try { await this.fileSystem.io.finishRuntime(); }
+      catch (error: any) { code = 1; this.terminalService.writeLine(`\x1b[31mFile commit failed: ${error.message} — keep this page open and retry saving.\x1b[0m`); }
+      this.taskAbort = null;
+      this.terminalService.endProgramExecution(code, performance.now() - t0); release();
     }
+    return code;
   }
 }

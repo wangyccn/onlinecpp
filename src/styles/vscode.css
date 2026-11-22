@@ -902,3 +902,81 @@ body, html {
   text-decoration: underline;
 }
 
+/* ==========================================================================
+   PROGRESS BAR (IDEA-style task indicator)
+   ========================================================================== */
+@keyframes progress-indeterminate {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(200%); }
+  100% { transform: translateX(-100%); }
+}
+
+.progress-bar-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 1000;
+  pointer-events: none;
+  display: none;
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.progress-bar-fill {
+  height: 100%;
+  width: 0%;
+  transition: width 0.2s ease, opacity 0.3s ease;
+  background: linear-gradient(90deg, #007acc, #4fc1ff);
+  border-radius: 0 2px 2px 0;
+  box-shadow: 0 0 4px rgba(0, 122, 204, 0.5);
+}
+
+.progress-bar-label {
+  position: absolute;
+  top: 5px;
+  right: 8px;
+  font-size: 11px;
+  color: #858585;
+  white-space: nowrap;
+  pointer-events: none;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+/* ==========================================================================
+   CLEANUP SETTINGS SECTION
+   ========================================================================== */
+.cleanup-section {
+  border: 1px solid #3e3e42;
+  border-radius: 6px;
+  padding: 12px;
+  margin-top: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.cleanup-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.15s;
+}
+
+.cleanup-btn:hover { opacity: 0.85; }
+
+.cleanup-btn.btn-clear-cache {
+  background: rgba(204, 167, 0, 0.15);
+  border-color: rgba(204, 167, 0, 0.4);
+  color: #cca700;
+}
+
+.cleanup-btn.btn-clear-all {
+  background: rgba(241, 76, 76, 0.15);
+  border-color: rgba(241, 76, 76, 0.4);
+  color: #f14c4c;
+}
+

@@ -2,6 +2,10 @@ import * as monaco from 'monaco-editor';
 import { openClangdSession, ClangdSession } from '@algoproclub/clangd-wasm';
 import { isClangdWasmSupported } from '@algoproclub/clangd-wasm/support';
 import { DiagnosticItem } from '../types';
+import { scanCpp, isCppComment } from './cppLexical';
+
+const lspCancellation = (message: string) => Object.assign(new Error(message), { name: 'AbortError' });
+const isLspCancellation = (error: any) => error?.name === 'AbortError' || [-32800, -32801, -32802].includes(error?.code);
 
 const LSP_TO_MONACO_KIND_MAP: Record<number, monaco.languages.CompletionItemKind> = {
   1: monaco.languages.CompletionItemKind.Text,
@@ -33,6 +37,14 @@ const LSP_TO_MONACO_KIND_MAP: Record<number, monaco.languages.CompletionItemKind
 
 export class ClangdService {
   private clangdSession: ClangdSession | null = null;
+  private sessions = new Map<string, ClangdSession>();
+  private sessionPromises = new Map<string, Promise<void>>();
+  private sessionControllers = new Map<string, AbortController>();
+  private documents = new Map<string, { text: string; version: number; sentVersion: number }>();
+  private paused = false;
+  private lexicalCache = new WeakMap<monaco.editor.ITextModel, { version: number; scan: ReturnType<typeof scanCpp> }>();
+  private enabled = true;
+  private standard = 'c++20';
   private isLspSupported = false;
   private isLspConnected = false;
   private isInitializing = false;
@@ -42,6 +54,8 @@ export class ClangdService {
     resolve: (res: any) => void;
     reject: (err: any) => void;
     timer: any;
+    uri: string;
+    method: string;
   }>();
 
   // Diagnostics storage
@@ -137,139 +151,169 @@ export class ClangdService {
     );
   }
 
+  public configure(standard: string, enabled: boolean): void {
+    if (this.standard === standard && this.enabled === enabled) return;
+    this.resetWorkspace(); this.standard = standard; this.enabled = enabled;
+    const model = monaco.editor.getModels().find((model) => model.uri.toString() === this.activeUri);
+    if (model) void this.attachDocument(this.activeUri, model.getValue());
+  }
+
+  public setPaused(paused: boolean): void {
+    this.paused = paused;
+    if (paused) {
+      for (const [id, request] of this.pendingRequests) {
+        this.sessions.get(request.uri)?.port.postMessage({ jsonrpc: '2.0', method: '$/cancelRequest', params: { id } });
+        request.reject(lspCancellation('Language service paused for foreground task')); clearTimeout(request.timer);
+      }
+      this.pendingRequests.clear();
+    } else {
+      for (const uri of this.sessions.keys()) this.flushDocument(uri);
+      const document = this.documents.get(this.activeUri);
+      if (document && !this.sessions.has(this.activeUri)) void this.attachDocument(this.activeUri, document.text);
+    }
+  }
+
+  public retainDocuments(paths: string[]): void {
+    const keep = new Set(paths.map((path) => this.normalizeUri(path)));
+    for (const [id, request] of this.pendingRequests) if (!keep.has(request.uri)) {
+      this.sessions.get(request.uri)?.port.postMessage({ jsonrpc: '2.0', method: '$/cancelRequest', params: { id } });
+      request.reject(lspCancellation('Document closed')); this.pendingRequests.delete(id);
+    }
+    for (const [uri, session] of this.sessions) {
+      if (!keep.has(uri)) { session.dispose(); this.sessions.delete(uri); }
+    }
+    for (const [uri, controller] of this.sessionControllers) if (!keep.has(uri)) { controller.abort(); this.sessionControllers.delete(uri); }
+    for (const uri of this.documents.keys()) if (!keep.has(uri)) {
+      this.documents.delete(uri); this.lspDiagnostics.delete(uri); this.astDiagnostics.delete(uri);
+      clearTimeout(this.debouncedUpdateTimers.get(uri)); this.debouncedUpdateTimers.delete(uri);
+    }
+    this.isLspConnected = this.sessions.size > 0;
+  }
+
+  public resetWorkspace(): void {
+    for (const controller of this.sessionControllers.values()) controller.abort();
+    this.sessionControllers.clear();
+    for (const session of this.sessions.values()) session.dispose();
+    this.sessions.clear(); this.sessionPromises.clear(); this.documents.clear();
+    this.clangdSession = null; this.isLspConnected = false; this.isInitializing = false;
+    for (const timer of this.debouncedUpdateTimers.values()) clearTimeout(timer);
+    this.debouncedUpdateTimers.clear();
+    for (const request of this.pendingRequests.values()) { clearTimeout(request.timer); request.reject(lspCancellation('Workspace closed')); }
+    this.pendingRequests.clear(); this.lspDiagnostics.clear(); this.astDiagnostics.clear(); this.compilerDiagnostics = [];
+    this.notifyStatusChange(); this.broadcastDiagnostics();
+  }
+
   public async attachDocument(rawUri: string, initialCode: string): Promise<void> {
-    const uri = this.normalizeUri(rawUri);
-    this.activeUri = uri;
-
-    if (!this.isLspSupported) {
-      // In AST Engine mode, immediately perform AST syntax checking
-      const model = this.getModelByUri(uri);
-      if (model) {
-        this.runAstDiagnostics(model);
-      }
-      return;
-    }
-
-    try {
-      this.isInitializing = true;
-      this.notifyStatusChange();
-
-      if (this.clangdSession) {
-        try {
-          this.clangdSession.dispose();
-        } catch {
-          // ignore
+    const uri = this.normalizeUri(rawUri); this.activeUri = uri;
+    if (!/\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/i.test(uri)) return;
+    if (!this.documents.has(uri)) this.documents.set(uri, { text: initialCode, version: this.getModelByUri(uri)?.getVersionId() || 1, sentVersion: 0 });
+    if (!this.enabled || this.paused) return;
+    if (this.sessions.has(uri)) { this.clangdSession = this.sessions.get(uri)!; this.flushDocument(uri); return; }
+    if (this.sessionPromises.has(uri)) return this.sessionPromises.get(uri);
+    if (!this.isLspSupported) { const model = this.getModelByUri(uri); if (model) this.runAstDiagnostics(model); return; }
+    const controller = new AbortController(); this.sessionControllers.set(uri, controller);
+    const opening = (async () => {
+      try {
+        this.isInitializing = true; this.notifyStatusChange();
+        const c = uri.toLowerCase().endsWith('.c');
+        const session = await openClangdSession({ uri, signal: controller.signal, compilerArguments: [
+          '-x', c ? 'c' : 'c++', c ? '-std=c17' : `-std=${this.standard}`, '-Wno-register', '-Wno-deprecated-register', '-Wno-shift-op-parentheses',
+        ] });
+        if (controller.signal.aborted || !this.documents.has(uri)) { session.dispose(); return; }
+        this.sessions.set(uri, session); this.clangdSession = session;
+        this.isLspConnected = true;
+        session.port.addEventListener('message', (event) => this.handlePortMessage(event.data)); session.port.start();
+        const document = this.documents.get(uri)!;
+        session.port.postMessage({ jsonrpc: '2.0', method: 'textDocument/didOpen', params: {
+          textDocument: { uri, languageId: c ? 'c' : 'cpp', version: document.version, text: document.text },
+        } });
+        document.sentVersion = document.version;
+        session.closed.then(() => {
+          if (this.sessions.get(uri) === session) { this.sessions.delete(uri); this.isLspConnected = this.sessions.size > 0; this.notifyStatusChange(); }
+        }).catch(() => {});
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          console.warn('[ClangdService] Session unavailable:', error);
+          const model = this.getModelByUri(uri); if (model && !this.paused) this.runAstDiagnostics(model);
         }
-        this.clangdSession = null;
-        this.isLspConnected = false;
+      } finally {
+        if (this.sessionControllers.get(uri) === controller) { this.sessionPromises.delete(uri); this.sessionControllers.delete(uri); }
+        this.isInitializing = this.sessionPromises.size > 0; this.notifyStatusChange();
       }
-
-      this.clangdSession = await openClangdSession({
-        uri,
-        compilerArguments: [
-          '-std=c++20',
-          '-I/include/c++/v1',
-          '-Wno-register',
-          '-Wno-deprecated-register',
-          '-Wno-shift-op-parentheses',
-        ],
-      });
-
-      this.isLspConnected = true;
-      this.isInitializing = false;
-      this.notifyStatusChange();
-      console.log('[ClangdService] Clangd LSP session opened for:', uri);
-
-      // Listen for LSP messages on port
-      const messageListener = (event: MessageEvent) => {
-        this.handlePortMessage(event.data);
-      };
-      this.clangdSession.port.addEventListener('message', messageListener);
-      this.clangdSession.port.start();
-
-      // Monitor unexpected closure
-      this.clangdSession.closed.then((err) => {
-        console.warn('[ClangdService] Clangd session closed:', err);
-        this.isLspConnected = false;
-        this.clangdSession = null;
-        this.notifyStatusChange();
-      }).catch(() => {});
-
-      // Send textDocument/didOpen
-      this.sendLspNotification('textDocument/didOpen', {
-        textDocument: {
-          uri,
-          languageId: 'cpp',
-          version: 1,
-          text: initialCode,
-        },
-      });
-    } catch (err) {
-      console.warn('[ClangdService] Failed to establish clangd WASM session, falling back to AST Engine:', err);
-      this.isLspConnected = false;
-      this.isInitializing = false;
-      this.notifyStatusChange();
-
-      const model = this.getModelByUri(uri);
-      if (model) {
-        this.runAstDiagnostics(model);
-      }
-    }
+    })();
+    this.sessionPromises.set(uri, opening);
+    return opening;
   }
 
   public updateDocument(rawUri: string, newText: string, version: number): void {
     const uri = this.normalizeUri(rawUri);
-
-    if (this.debouncedUpdateTimers.has(uri)) {
-      clearTimeout(this.debouncedUpdateTimers.get(uri));
-    }
-
+    const previous = this.documents.get(uri);
+    this.documents.set(uri, { text: newText, version, sentVersion: previous?.sentVersion || 0 });
+    clearTimeout(this.debouncedUpdateTimers.get(uri));
     const timer = setTimeout(() => {
       this.debouncedUpdateTimers.delete(uri);
-
-      if (this.isLspConnected && this.clangdSession) {
-        // Real-time synchronization to Clangd Language Server
-        this.sendLspNotification('textDocument/didChange', {
-          textDocument: { uri, version },
-          contentChanges: [{ text: newText }],
-        });
-      } else {
-        // Real-time AST syntax analysis
-        const model = this.getModelByUri(uri);
-        if (model) {
-          this.runAstDiagnostics(model);
-        }
-      }
-    }, 250);
-
+      if (this.paused || !this.enabled) return;
+      if (this.sessions.has(uri)) this.flushDocument(uri);
+      else if (!this.sessionPromises.has(uri)) { const model = this.getModelByUri(uri); if (model) this.runAstDiagnostics(model); }
+    }, 350);
     this.debouncedUpdateTimers.set(uri, timer);
   }
 
-  public sendLspRequest<T = any>(method: string, params: any, timeoutMs = 4000): Promise<T> {
-    if (!this.clangdSession?.port || !this.isLspConnected) {
-      return Promise.reject(new Error('Clangd LSP not connected'));
+  private flushDocument(uri: string): void {
+    if (this.paused || !this.enabled) return;
+    const document = this.documents.get(uri), session = this.sessions.get(uri);
+    if (!document || !session || document.sentVersion >= document.version) return;
+    clearTimeout(this.debouncedUpdateTimers.get(uri)); this.debouncedUpdateTimers.delete(uri);
+    session.port.postMessage({ jsonrpc: '2.0', method: 'textDocument/didChange', params: {
+      textDocument: { uri, version: document.version }, contentChanges: [{ text: document.text }],
+    } });
+    document.sentVersion = document.version;
+  }
+
+  public sendLspRequest<T = any>(method: string, params: any, timeoutMs = 1600, token?: monaco.CancellationToken): Promise<T> {
+    const uri = this.normalizeUri(params.textDocument?.uri || this.activeUri);
+    const session = this.sessions.get(uri);
+    if (!session || this.paused || !this.enabled || token?.isCancellationRequested) {
+      return Promise.reject(lspCancellation('Clangd LSP not available'));
+    }
+    this.flushDocument(uri);
+    // Superseded completion/hover requests must not keep the single WASM engine busy.
+    for (const [id, pending] of this.pendingRequests) if (pending.uri === uri && pending.method === method) {
+      session.port.postMessage({ jsonrpc: '2.0', method: '$/cancelRequest', params: { id } });
+      this.pendingRequests.delete(id); pending.reject(lspCancellation('LSP request superseded'));
     }
 
     const id = ++this.nextRequestId;
     return new Promise<T>((resolve, reject) => {
+      let cancellation: monaco.IDisposable | undefined;
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
+        cancellation?.dispose();
+        session.port.postMessage({ jsonrpc: '2.0', method: '$/cancelRequest', params: { id } });
         reject(new Error(`LSP request ${method} (id=${id}) timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
       this.pendingRequests.set(id, {
         resolve: (val) => {
           clearTimeout(timer);
+          cancellation?.dispose();
           resolve(val);
         },
         reject: (err) => {
           clearTimeout(timer);
+          cancellation?.dispose();
           reject(err);
         },
         timer,
+        uri, method,
+      });
+      cancellation = token?.onCancellationRequested(() => {
+        const pending = this.pendingRequests.get(id); this.pendingRequests.delete(id);
+        session.port.postMessage({ jsonrpc: '2.0', method: '$/cancelRequest', params: { id } });
+        pending?.reject(lspCancellation('LSP request cancelled'));
       });
 
-      this.clangdSession!.port.postMessage({
+      session.port.postMessage({
         jsonrpc: '2.0',
         id,
         method,
@@ -298,7 +342,7 @@ export class ClangdService {
       clearTimeout(pending.timer);
 
       if (data.error) {
-        pending.reject(new Error(data.error.message || `LSP error ${data.error.code}`));
+        pending.reject(Object.assign(new Error(data.error.message || `LSP error ${data.error.code}`), { code: data.error.code }));
       } else {
         pending.resolve(data.result);
       }
@@ -316,6 +360,7 @@ export class ClangdService {
     if (!params || !params.diagnostics) return;
 
     const uri = this.normalizeUri(params.uri);
+    if (params.version !== undefined && params.version < (this.documents.get(uri)?.version || 0)) return;
     const items: DiagnosticItem[] = params.diagnostics.map((d: any) => ({
       file: uri.replace(/^file:\/\/\/?/, ''),
       line: (d.range?.start?.line ?? 0) + 1,
@@ -354,6 +399,7 @@ export class ClangdService {
     const uri = this.normalizeUri(model.uri.toString());
     const code = model.getValue();
     const lines = code.split(/\r?\n/);
+    const uncommented = this.lexical(model).code.split(/\r?\n/);
     const markers: monaco.editor.IMarkerData[] = [];
     const items: DiagnosticItem[] = [];
 
@@ -456,7 +502,7 @@ export class ClangdService {
       }
 
       // 2. Syntax Check: Missing Semicolons
-      const trimmed = lineText.trim();
+      const trimmed = uncommented[lineIdx].trim();
       if (
         trimmed &&
         !trimmed.startsWith('//') &&
@@ -472,7 +518,7 @@ export class ClangdService {
 
         if (isStatementStarter && !endsWithSemicolonOrBracket) {
           // Check next line to ensure it is not a continuation
-          const nextLine = lines[lineIdx + 1]?.trim() || '';
+          const nextLine = uncommented[lineIdx + 1]?.trim() || '';
           const isContinuation =
             nextLine.startsWith('<<') ||
             nextLine.startsWith('>>') ||
@@ -613,11 +659,31 @@ export class ClangdService {
     }
   }
 
+  private lexical(model: monaco.editor.ITextModel): ReturnType<typeof scanCpp> {
+    const version = model.getVersionId(), cached = this.lexicalCache.get(model);
+    if (cached?.version === version) return cached.scan;
+    const scan = scanCpp(model.getValue()); this.lexicalCache.set(model, { version, scan }); return scan;
+  }
+
+  private inComment(model: monaco.editor.ITextModel, position: monaco.Position): boolean {
+    return isCppComment(this.lexical(model), model.getOffsetAt(position));
+  }
+
+  private visibleStd(model: monaco.editor.ITextModel, position: monaco.Position, range: monaco.IRange): monaco.languages.CompletionItem[] {
+    const before = this.lexical(model).symbols.slice(0, model.getOffsetAt(position));
+    const hasUsingNamespaceStd = /\busing\s+namespace\s+std\s*;/.test(before);
+    if (hasUsingNamespaceStd) return this.getStdSuggestions(range, false);
+    const names = new Set([...before.matchAll(/\busing\s+std\s*::\s*(\w+)\s*;/g)].map((match) => match[1]));
+    return this.getStdSuggestions(range, true).filter((item) => names.has(String(item.label)));
+  }
+
   private registerMonacoLanguageProviders(): void {
     // 1. Completion Provider (LSP First + AST & Snippet Fallback)
     const completionProvider = monaco.languages.registerCompletionItemProvider('cpp', {
       triggerCharacters: ['.', ':', '>', '<', '#', '"', '/'],
-      provideCompletionItems: async (model, position, context) => {
+      provideCompletionItems: async (model, position, context, token) => {
+        if (token.isCancellationRequested || this.inComment(model, position)) return { suggestions: [] };
+        const requestedVersion = model.getVersionId();
         const lineContent = model.getLineContent(position.lineNumber);
         const textUntilPosition = lineContent.substring(0, position.column - 1);
         const word = model.getWordUntilPosition(position);
@@ -646,17 +712,38 @@ export class ClangdService {
                   triggerCharacter: context.triggerCharacter,
                 },
               },
-              3500
+              1600, token
             );
 
+            if (token.isCancellationRequested || requestedVersion !== model.getVersionId()) return { suggestions: [] };
             if (response) {
               const rawItems = Array.isArray(response) ? response : (response.items || []);
               if (rawItems.length > 0) {
                 const suggestions = this.convertLspCompletionItems(rawItems, model, position, defaultRange);
+                // When `using namespace std;` is in scope, strip redundant `std::` from LSP completions
+                // to match the user's coding style and avoid unmaintainable qualified names.
+                const before = this.lexical(model).symbols.slice(0, model.getOffsetAt(position));
+                const hasUsingNamespaceStd = /\busing\s+namespace\s+std\s*;/.test(before);
+                if (hasUsingNamespaceStd) {
+                  for (const item of suggestions) {
+                    if (typeof item.insertText === 'string' && item.insertText.startsWith('std::')) {
+                      item.insertText = item.insertText.slice(5);
+                    }
+                    if (typeof item.filterText === 'string' && item.filterText.startsWith('std::')) {
+                      item.filterText = item.filterText.slice(5);
+                    }
+                  }
+                }
+                if (!/(?:\.|->|::)\w*$/.test(textUntilPosition)) {
+                  const existing = new Set(suggestions.map((item) => String(item.filterText || item.label).replace(/\(.*$/, '').trim()));
+                  suggestions.push(...this.visibleStd(model, position, defaultRange).filter((item) => !existing.has(String(item.label))));
+                }
 
                 // Blend in standard template snippets if appropriate
                 if (word.word && word.word.length >= 2) {
-                  const snippets = this.getSnippetSuggestions(defaultRange).filter((s) =>
+                  const before = this.lexical(model).symbols.slice(0, model.getOffsetAt(position));
+                  const hasUsingNamespaceStd = /\busing\s+namespace\s+std\s*;/.test(before);
+                  const snippets = this.getSnippetSuggestions(defaultRange, !hasUsingNamespaceStd).filter((s) =>
                     s.label.toString().toLowerCase().startsWith(word.word.toLowerCase())
                   );
                   suggestions.push(...snippets);
@@ -669,6 +756,7 @@ export class ClangdService {
               }
             }
           } catch (err) {
+            if (isLspCancellation(err) || token.isCancellationRequested) return { suggestions: [] };
             console.warn('[ClangdService] LSP completion failed, falling back to AST Engine:', err);
           }
         }
@@ -688,7 +776,8 @@ export class ClangdService {
 
     // 2. Hover Provider (LSP First + Standard Docs Fallback)
     const hoverProvider = monaco.languages.registerHoverProvider('cpp', {
-      provideHover: async (model, position) => {
+      provideHover: async (model, position, token) => {
+        if (token.isCancellationRequested || this.inComment(model, position)) return null;
         if (this.isLspConnected && this.clangdSession) {
           try {
             const uri = this.normalizeUri(model.uri.toString());
@@ -701,9 +790,10 @@ export class ClangdService {
                   character: position.column - 1,
                 },
               },
-              2000
+              1200, token
             );
 
+            if (token.isCancellationRequested) return null;
             if (response && response.contents) {
               let contents: monaco.IMarkdownString[] = [];
 
@@ -730,6 +820,7 @@ export class ClangdService {
               return { contents, range };
             }
           } catch (err) {
+            if (isLspCancellation(err) || token.isCancellationRequested) return null;
             console.warn('[ClangdService] LSP hover failed:', err);
           }
         }
@@ -759,6 +850,7 @@ export class ClangdService {
     const signatureHelpProvider = monaco.languages.registerSignatureHelpProvider('cpp', {
       signatureHelpTriggerCharacters: ['(', ','],
       provideSignatureHelp: async (model, position, token, context) => {
+        if (token.isCancellationRequested || this.inComment(model, position)) return null;
         if (this.isLspConnected && this.clangdSession) {
           try {
             const uri = this.normalizeUri(model.uri.toString());
@@ -777,7 +869,7 @@ export class ClangdService {
                   isRetrigger: context.isRetrigger,
                 },
               },
-              2000
+              1200, token
             );
 
             if (response && response.signatures && response.signatures.length > 0) {
@@ -798,6 +890,7 @@ export class ClangdService {
               };
             }
           } catch (err) {
+            if (isLspCancellation(err) || token.isCancellationRequested) return null;
             console.warn('[ClangdService] LSP signatureHelp failed:', err);
           }
         }
@@ -828,7 +921,7 @@ export class ClangdService {
 
     // 4. Document Formatting Provider
     const formattingProvider = monaco.languages.registerDocumentFormattingEditProvider('cpp', {
-      provideDocumentFormattingEdits: async (model, options) => {
+      provideDocumentFormattingEdits: async (model, options, token) => {
         if (this.isLspConnected && this.clangdSession) {
           try {
             const uri = this.normalizeUri(model.uri.toString());
@@ -841,7 +934,7 @@ export class ClangdService {
                   insertSpaces: options.insertSpaces,
                 },
               },
-              4000
+              3000, token
             );
 
             if (Array.isArray(edits)) {
@@ -856,6 +949,7 @@ export class ClangdService {
               }));
             }
           } catch (e) {
+            if (isLspCancellation(e) || token.isCancellationRequested) return [];
             console.warn('[ClangdService] LSP formatting failed:', e);
           }
         }
@@ -865,7 +959,8 @@ export class ClangdService {
 
     // 5. Definition Provider
     const definitionProvider = monaco.languages.registerDefinitionProvider('cpp', {
-      provideDefinition: async (model, position) => {
+      provideDefinition: async (model, position, token) => {
+        if (token.isCancellationRequested || this.inComment(model, position)) return null;
         if (this.isLspConnected && this.clangdSession) {
           try {
             const uri = this.normalizeUri(model.uri.toString());
@@ -878,7 +973,7 @@ export class ClangdService {
                   character: position.column - 1,
                 },
               },
-              2000
+              1600, token
             );
 
             if (response) {
@@ -894,6 +989,7 @@ export class ClangdService {
               }));
             }
           } catch (e) {
+            if (isLspCancellation(e) || token.isCancellationRequested) return null;
             console.warn('[ClangdService] LSP definition failed:', e);
           }
         }
@@ -996,11 +1092,9 @@ export class ClangdService {
       return this.getIncludeSuggestions(range);
     }
 
-    const isStd =
-      textUntilPosition.endsWith('std::') ||
-      lineContent.substring(0, position.column - 1).endsWith('std::');
+    const isStd = /\bstd::\w*$/.test(textUntilPosition);
     if (isStd) {
-      return this.getStdSuggestions(range);
+      return this.getStdSuggestions(range, true);
     }
 
     // Dot or Arrow Member Access: obj. or ptr->
@@ -1013,9 +1107,12 @@ export class ClangdService {
     // General suggestions
     const userSymbols = this.extractSymbolsFromDocument(model, range);
     const generalSuggestions = this.getGeneralCppSuggestions(range);
-    const snippetSuggestions = this.getSnippetSuggestions(range);
+    // Detect whether std is qualified in scope to pass correct prefix mode to snippets
+    const before = this.lexical(model).symbols.slice(0, model.getOffsetAt(position));
+    const hasUsingNamespaceStd = /\busing\s+namespace\s+std\s*;/.test(before);
+    const snippetSuggestions = this.getSnippetSuggestions(range, !hasUsingNamespaceStd);
 
-    return [...snippetSuggestions, ...userSymbols, ...generalSuggestions];
+    return [...this.visibleStd(model, position, range), ...snippetSuggestions, ...userSymbols, ...generalSuggestions];
   }
 
   private getMemberSuggestions(
@@ -1023,7 +1120,7 @@ export class ClangdService {
     model: monaco.editor.ITextModel,
     range: monaco.IRange
   ): monaco.languages.CompletionItem[] {
-    const code = model.getValue();
+    const code = this.lexical(model).symbols;
     let detectedType = '';
 
     const varDeclRegex = new RegExp(`\\b([a-zA-Z0-9_<>:]+)\\s+${varName}\\b`, 'g');
@@ -1120,7 +1217,7 @@ export class ClangdService {
     model: monaco.editor.ITextModel,
     range: monaco.IRange
   ): monaco.languages.CompletionItem[] {
-    const code = model.getValue();
+    const code = this.lexical(model).symbols;
     const suggestions: monaco.languages.CompletionItem[] = [];
     const seen = new Set<string>();
 
@@ -1202,34 +1299,38 @@ export class ClangdService {
     }));
   }
 
-  private getStdSuggestions(range: monaco.IRange): monaco.languages.CompletionItem[] {
-    const items = [
-      { name: 'cout', kind: monaco.languages.CompletionItemKind.Variable, detail: 'std::ostream cout', insert: 'cout << $0 << std::endl;' },
-      { name: 'cin', kind: monaco.languages.CompletionItemKind.Variable, detail: 'std::istream cin', insert: 'cin >> $0;' },
-      { name: 'cerr', kind: monaco.languages.CompletionItemKind.Variable, detail: 'std::ostream cerr', insert: 'cerr << $0 << std::endl;' },
-      { name: 'endl', kind: monaco.languages.CompletionItemKind.Constant, detail: 'std::endl manipulator', insert: 'endl' },
-      { name: 'vector', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::vector<T>', insert: 'vector<${1:int}> ${2:vec};' },
-      { name: 'string', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::string', insert: 'string ${1:str};' },
-      { name: 'map', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::map<Key, Value>', insert: 'map<${1:string}, ${2:int}> ${3:map};' },
-      { name: 'unordered_map', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::unordered_map<Key, Value>', insert: 'unordered_map<${1:string}, ${2:int}> ${3:map};' },
-      { name: 'set', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::set<T>', insert: 'set<${1:int}> ${2:s};' },
-      { name: 'sort', kind: monaco.languages.CompletionItemKind.Function, detail: 'void sort(RandomIt first, RandomIt last)', insert: 'sort(${1:vec}.begin(), ${1:vec}.end());' },
-      { name: 'reverse', kind: monaco.languages.CompletionItemKind.Function, detail: 'void reverse(BidirIt first, BidirIt last)', insert: 'reverse(${1:vec}.begin(), ${1:vec}.end());' },
-      { name: 'find', kind: monaco.languages.CompletionItemKind.Function, detail: 'InputIt find(InputIt first, InputIt last, const T& value)', insert: 'find(${1:vec}.begin(), ${1:vec}.end(), ${2:val});' },
-      { name: 'binary_search', kind: monaco.languages.CompletionItemKind.Function, detail: 'bool binary_search(ForwardIt first, ForwardIt last, const T& value)', insert: 'binary_search(${1:vec}.begin(), ${1:vec}.end(), ${2:val})' },
-      { name: 'lower_bound', kind: monaco.languages.CompletionItemKind.Function, detail: 'ForwardIt lower_bound(ForwardIt first, ForwardIt last, const T& value)', insert: 'lower_bound(${1:vec}.begin(), ${1:vec}.end(), ${2:val})' },
-      { name: 'upper_bound', kind: monaco.languages.CompletionItemKind.Function, detail: 'ForwardIt upper_bound(ForwardIt first, ForwardIt last, const T& value)', insert: 'upper_bound(${1:vec}.begin(), ${1:vec}.end(), ${2:val})' },
-      { name: 'make_unique', kind: monaco.languages.CompletionItemKind.Function, detail: 'std::unique_ptr<T> make_unique<T>(Args&&...)', insert: 'make_unique<${1:Type}>($0)' },
-      { name: 'make_shared', kind: monaco.languages.CompletionItemKind.Function, detail: 'std::shared_ptr<T> make_shared<T>(Args&&...)', insert: 'make_shared<${1:Type}>($0)' },
-      { name: 'unique_ptr', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::unique_ptr<T>', insert: 'unique_ptr<${1:Type}>' },
-      { name: 'shared_ptr', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::shared_ptr<T>', insert: 'shared_ptr<${1:Type}>' },
-      { name: 'pair', kind: monaco.languages.CompletionItemKind.Struct, detail: 'std::pair<T1, T2>', insert: 'pair<${1:int}, ${2:string}>' },
-      { name: 'make_pair', kind: monaco.languages.CompletionItemKind.Function, detail: 'std::make_pair(x, y)', insert: 'make_pair(${1:x}, ${2:y})' },
-      { name: 'max', kind: monaco.languages.CompletionItemKind.Function, detail: 'const T& max(const T& a, const T& b)', insert: 'max(${1:a}, ${2:b})' },
-      { name: 'min', kind: monaco.languages.CompletionItemKind.Function, detail: 'const T& min(const T& a, const T& b)', insert: 'min(${1:a}, ${2:b})' },
-      { name: 'swap', kind: monaco.languages.CompletionItemKind.Function, detail: 'void swap(T& a, T& b)', insert: 'swap(${1:a}, ${2:b});' },
-      { name: 'clamp', kind: monaco.languages.CompletionItemKind.Function, detail: 'T clamp(T v, T lo, T hi)', insert: 'clamp(${1:val}, ${2:min}, ${3:max})' },
-      { name: 'iota', kind: monaco.languages.CompletionItemKind.Function, detail: 'void iota(ForwardIt first, ForwardIt last, T value)', insert: 'iota(${1:vec}.begin(), ${1:vec}.end(), ${2:0});' },
+  private getStdSuggestions(range: monaco.IRange, qualified = true): monaco.languages.CompletionItem[] {
+    // When `using namespace std;` is in scope, completions should NOT add `std::` prefix.
+    // When accessed via `std::`, or when no using-declaration exists, prefix with `std::`.
+    // Note: snippet placeholders like ${1:vec} must not be confused with template literal interpolation.
+    const p = qualified ? 'std::' : '';
+    const items: Array<{ name: string; kind: monaco.languages.CompletionItemKind; detail: string; insert: string }> = [
+      { name: 'cout', kind: monaco.languages.CompletionItemKind.Variable, detail: 'std::ostream cout', insert: p + 'cout << $0 << ' + p + 'endl;' },
+      { name: 'cin', kind: monaco.languages.CompletionItemKind.Variable, detail: 'std::istream cin', insert: p + 'cin >> $0;' },
+      { name: 'cerr', kind: monaco.languages.CompletionItemKind.Variable, detail: 'std::ostream cerr', insert: p + 'cerr << $0 << ' + p + 'endl;' },
+      { name: 'endl', kind: monaco.languages.CompletionItemKind.Constant, detail: 'std::endl manipulator', insert: p + 'endl' },
+      { name: 'vector', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::vector<T>', insert: p + 'vector<${1:int}> ${2:vec};' },
+      { name: 'string', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::string', insert: p + 'string ${1:str};' },
+      { name: 'map', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::map<Key, Value>', insert: p + 'map<${1:string}, ${2:int}> ${3:map};' },
+      { name: 'unordered_map', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::unordered_map<Key, Value>', insert: p + 'unordered_map<${1:string}, ${2:int}> ${3:map};' },
+      { name: 'set', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::set<T>', insert: p + 'set<${1:int}> ${2:s};' },
+      { name: 'sort', kind: monaco.languages.CompletionItemKind.Function, detail: 'void sort(RandomIt first, RandomIt last)', insert: p + 'sort(${1:vec}.begin(), ${1:vec}.end());' },
+      { name: 'reverse', kind: monaco.languages.CompletionItemKind.Function, detail: 'void reverse(BidirIt first, BidirIt last)', insert: p + 'reverse(${1:vec}.begin(), ${1:vec}.end());' },
+      { name: 'find', kind: monaco.languages.CompletionItemKind.Function, detail: 'InputIt find(InputIt first, InputIt last, const T& value)', insert: p + 'find(${1:vec}.begin(), ${1:vec}.end(), ${2:val});' },
+      { name: 'binary_search', kind: monaco.languages.CompletionItemKind.Function, detail: 'bool binary_search(ForwardIt first, ForwardIt last, const T& value)', insert: p + 'binary_search(${1:vec}.begin(), ${1:vec}.end(), ${2:val})' },
+      { name: 'lower_bound', kind: monaco.languages.CompletionItemKind.Function, detail: 'ForwardIt lower_bound(ForwardIt first, ForwardIt last, const T& value)', insert: p + 'lower_bound(${1:vec}.begin(), ${1:vec}.end(), ${2:val})' },
+      { name: 'upper_bound', kind: monaco.languages.CompletionItemKind.Function, detail: 'ForwardIt upper_bound(ForwardIt first, ForwardIt last, const T& value)', insert: p + 'upper_bound(${1:vec}.begin(), ${1:vec}.end(), ${2:val})' },
+      { name: 'make_unique', kind: monaco.languages.CompletionItemKind.Function, detail: 'std::unique_ptr<T> make_unique<T>(Args&&...)', insert: p + 'make_unique<${1:Type}>($0)' },
+      { name: 'make_shared', kind: monaco.languages.CompletionItemKind.Function, detail: 'std::shared_ptr<T> make_shared<T>(Args&&...)', insert: p + 'make_shared<${1:Type}>($0)' },
+      { name: 'unique_ptr', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::unique_ptr<T>', insert: p + 'unique_ptr<${1:Type}>' },
+      { name: 'shared_ptr', kind: monaco.languages.CompletionItemKind.Class, detail: 'std::shared_ptr<T>', insert: p + 'shared_ptr<${1:Type}>' },
+      { name: 'pair', kind: monaco.languages.CompletionItemKind.Struct, detail: 'std::pair<T1, T2>', insert: p + 'pair<${1:int}, ${2:string}>' },
+      { name: 'make_pair', kind: monaco.languages.CompletionItemKind.Function, detail: 'std::make_pair(x, y)', insert: p + 'make_pair(${1:x}, ${2:y})' },
+      { name: 'max', kind: monaco.languages.CompletionItemKind.Function, detail: 'const T& max(const T& a, const T& b)', insert: p + 'max(${1:a}, ${2:b})' },
+      { name: 'min', kind: monaco.languages.CompletionItemKind.Function, detail: 'const T& min(const T& a, const T& b)', insert: p + 'min(${1:a}, ${2:b})' },
+      { name: 'swap', kind: monaco.languages.CompletionItemKind.Function, detail: 'void swap(T& a, T& b)', insert: p + 'swap(${1:a}, ${2:b});' },
+      { name: 'clamp', kind: monaco.languages.CompletionItemKind.Function, detail: 'T clamp(T v, T lo, T hi)', insert: p + 'clamp(${1:val}, ${2:min}, ${3:max})' },
+      { name: 'iota', kind: monaco.languages.CompletionItemKind.Function, detail: 'void iota(ForwardIt first, ForwardIt last, T value)', insert: p + 'iota(${1:vec}.begin(), ${1:vec}.end(), ${2:0});' },
     ];
 
     return items.map((item) => ({
@@ -1260,8 +1361,9 @@ export class ClangdService {
     }));
   }
 
-  private getSnippetSuggestions(range: monaco.IRange): monaco.languages.CompletionItem[] {
-    const snippets = [
+  private getSnippetSuggestions(range: monaco.IRange, qualified = true): monaco.languages.CompletionItem[] {
+    const p = qualified ? 'std::' : '';
+    const snippets: Array<{ label: string; detail: string; insert: string }> = [
       {
         label: 'main',
         detail: 'int main(int argc, char* argv[])',
@@ -1310,17 +1412,17 @@ export class ClangdService {
       {
         label: 'trycatch',
         detail: 'try-catch block',
-        insert: 'try {\n\t${1}\n} catch (const std::exception& ${2:e}) {\n\tstd::cerr << ${2:e}.what() << std::endl;\n}',
+        insert: 'try {\n\t${1}\n} catch (const ' + p + 'exception& ${2:e}) {\n\t' + p + 'cerr << ${2:e}.what() << ' + p + 'endl;\n}',
       },
       {
         label: 'cout',
-        detail: 'std::cout << ... << std::endl',
-        insert: 'std::cout << ${1:"message"} << std::endl;',
+        detail: p + 'cout << ... << ' + p + 'endl',
+        insert: p + 'cout << ${1:"message"} << ' + p + 'endl;',
       },
       {
         label: 'cin',
-        detail: 'std::cin >> variable',
-        insert: 'std::cin >> ${1:var};',
+        detail: p + 'cin >> variable',
+        insert: p + 'cin >> ${1:var};',
       },
       {
         label: 'lambda',
@@ -1385,22 +1487,7 @@ export class ClangdService {
   }
 
   public dispose(): void {
-    if (this.clangdSession) {
-      try {
-        this.clangdSession.dispose();
-      } catch {
-        // ignore
-      }
-      this.clangdSession = null;
-    }
-    this.pendingRequests.forEach(({ reject, timer }) => {
-      clearTimeout(timer);
-      reject(new Error('ClangdService disposed'));
-    });
-    this.pendingRequests.clear();
-    this.debouncedUpdateTimers.forEach((timer) => clearTimeout(timer));
-    this.debouncedUpdateTimers.clear();
-    this.disposables.forEach((d) => d.dispose());
-    this.disposables = [];
+    this.resetWorkspace();
+    this.disposables.forEach((disposable) => disposable.dispose()); this.disposables = [];
   }
 }

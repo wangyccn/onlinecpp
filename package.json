@@ -4,6 +4,8 @@
   "description": "Native-grade in-browser C++ IDE powered by WebAssembly, Clang, Monaco Editor and xterm.js",
   "type": "module",
   "scripts": {
+    "test": "node tests/run.mjs",
+    "test:browser": "vite --config tests/vite.config.ts",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

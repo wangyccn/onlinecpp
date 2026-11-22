@@ -1,27 +1,46 @@
 import { FileItem } from '../types';
+import { NativeIO, NativeEntry, NativeStat, type StorageMode } from './nativeIO';
+import { WriteQueue } from './writeQueue';
+import { cleanNativePath } from './localPaths';
 
 export class FileSystemService {
   private rootDirHandle: FileSystemDirectoryHandle | null = null;
   private rootName = '';
+  private browserWorkspace = false;
   private onFilesChangedCallbacks: Array<(items: FileItem[]) => void> = [];
-  private taskQueue: Promise<any> = Promise.resolve();
+  public readonly io = new NativeIO();
+  private writes = new WriteQueue<Uint8Array | string>((path, data) => this.io.request('write', path, data));
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor() {
-    // No mock/virtual demo files. The user must open a real local folder.
+  public flush(): Promise<void> { return this.writes.flush(); }
+  public async syncToDisk(): Promise<void> { await this.flush(); await this.io.request('flushDisk', ''); }
+  public async clearAllStorage(): Promise<void> { await this.flush(); await this.io.request('clearAll', ''); await this.refreshSoon(); }
+  public async clearCache(): Promise<void> { await this.flush(); await this.io.request('clearCache', ''); await this.refreshSoon(); }
+  public getStorageMode(): StorageMode { return this.browserWorkspace ? 'browser' : 'disk'; }
+  public async useBrowserStorage(): Promise<void> {
+    await this.flush(); await this.io.mount(null);
+    this.browserWorkspace = true; this.rootName = 'Browser Workspace (IndexedDB)';
+    this.notifyFilesChanged(await this.listFiles());
   }
 
-  public enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.taskQueue.then(task, task);
-    this.taskQueue = next.catch(() => {});
-    return next;
+  private refreshSoon(): void {
+    clearTimeout(this.refreshTimer);
+    this.refreshTimer = setTimeout(() => {
+      this.listFiles().then((items) => this.notifyFilesChanged(items)).catch(console.warn);
+    }, 200);
   }
 
   public hasOpenFolder(): boolean {
-    return this.rootDirHandle !== null;
+    return this.browserWorkspace || this.rootDirHandle !== null;
   }
 
   public getRootName(): string {
     return this.rootName || 'No Folder Opened';
+  }
+
+  public async mountDirectory(handle: FileSystemDirectoryHandle): Promise<void> {
+    await this.flush(); await this.io.mount(handle);
+    this.browserWorkspace = false; this.rootDirHandle = handle; this.rootName = handle.name;
   }
 
   public onFilesChanged(callback: (items: FileItem[]) => void): () => void {
@@ -37,7 +56,7 @@ export class FileSystemService {
     }
   }
 
-  public async openNativeDirectory(): Promise<boolean> {
+  public async openNativeDirectory(beforeMount?: () => Promise<void>): Promise<boolean> {
     const showPicker = (window as any).showDirectoryPicker;
     if (!showPicker) {
       alert('Your browser does not support the File System Access API (window.showDirectoryPicker). Please use Chrome, Edge, or Opera.');
@@ -48,8 +67,8 @@ export class FileSystemService {
       const dirHandle = await showPicker({
         mode: 'readwrite',
       });
-      this.rootDirHandle = dirHandle;
-      this.rootName = dirHandle.name;
+      await beforeMount?.();
+      await this.mountDirectory(dirHandle);
       const files = await this.listFiles();
       this.notifyFilesChanged(files);
       return true;
@@ -63,27 +82,22 @@ export class FileSystemService {
   }
 
   public async listFiles(targetDir = ''): Promise<FileItem[]> {
-    if (!this.rootDirHandle) {
+    if (!this.hasOpenFolder()) {
       return [];
     }
 
     const clean = targetDir.replace(/^\/+|\/+$/g, '');
     if (!clean) {
-      return await this.readDirectoryRecursively(this.rootDirHandle, '');
+      return await this.readDirectoryRecursively('');
     }
 
-    const dirHandle = await this.resolveDirectoryHandle(clean);
-    if (!dirHandle) {
-      return [];
-    }
-
-    return await this.readDirectoryRecursively(dirHandle, clean);
+    return await this.readDirectoryRecursively(clean);
   }
 
   public async resolveDirectoryHandle(
     dirPath: string
   ): Promise<FileSystemDirectoryHandle | null> {
-    if (!this.rootDirHandle) return null;
+    if (this.browserWorkspace || !this.rootDirHandle) return null;
     const clean = dirPath.replace(/^\/+|\/+$/g, '');
     if (!clean || clean === '.') return this.rootDirHandle;
     const segments = clean.split('/').filter(Boolean);
@@ -99,20 +113,17 @@ export class FileSystemService {
   }
 
   public async directoryExists(dirPath: string): Promise<boolean> {
-    const handle = await this.resolveDirectoryHandle(dirPath);
-    return handle !== null;
+    return (await this.io.request<NativeStat | null>('stat', dirPath))?.kind === 'directory';
   }
 
   public async fileExists(filePath: string): Promise<boolean> {
-    const handle = await this.resolveNativeFileHandle(filePath, false);
-    return handle !== null;
+    return (await this.io.request<NativeStat | null>('stat', filePath))?.kind === 'file';
   }
 
   public async getFileMetadata(filePath: string): Promise<{ size: number; lastModified: number } | null> {
     try {
-      const handle = await this.resolveNativeFileHandle(filePath, false);
-      if (!handle) return null;
-      const file = await handle.getFile();
+      const file = await this.io.request<NativeStat | null>('stat', filePath);
+      if (!file || file.kind !== 'file') return null;
       return {
         size: file.size,
         lastModified: file.lastModified,
@@ -140,7 +151,6 @@ export class FileSystemService {
   }
 
   private async readDirectoryRecursively(
-    dirHandle: FileSystemDirectoryHandle,
     relativeDir: string,
     depth = 0
   ): Promise<FileItem[]> {
@@ -148,15 +158,14 @@ export class FileSystemService {
     const items: FileItem[] = [];
 
     try {
-      // @ts-ignore
-      for await (const [name, handle] of dirHandle.entries()) {
+      const entries = await this.io.request<NativeEntry[]>('list', relativeDir);
+      for (const { name, kind } of entries) {
         if (this.shouldIgnoreName(name)) {
           continue;
         }
         const itemPath = relativeDir ? `${relativeDir}/${name}` : name;
-        if (handle.kind === 'directory') {
+        if (kind === 'directory') {
           const children = await this.readDirectoryRecursively(
-            handle as FileSystemDirectoryHandle,
             itemPath,
             depth + 1
           );
@@ -165,7 +174,6 @@ export class FileSystemService {
             path: itemPath,
             isDirectory: true,
             isExpanded: true,
-            handle,
             children,
           });
         } else {
@@ -173,7 +181,6 @@ export class FileSystemService {
             name,
             path: itemPath,
             isDirectory: false,
-            handle,
           });
         }
       }
@@ -192,22 +199,11 @@ export class FileSystemService {
   }
 
   public async readFile(filePath: string): Promise<string> {
-    const fileHandle = await this.resolveNativeFileHandle(filePath, false);
-    if (!fileHandle) {
-      throw new Error(`File not found: ${filePath}`);
-    }
-    const file = await fileHandle.getFile();
-    return await file.text();
+    return new TextDecoder().decode(await this.readBinaryFile(filePath));
   }
 
   public async readBinaryFile(filePath: string): Promise<Uint8Array> {
-    const fileHandle = await this.resolveNativeFileHandle(filePath, false);
-    if (!fileHandle) {
-      throw new Error(`File not found: ${filePath}`);
-    }
-    const file = await fileHandle.getFile();
-    const buffer = await file.arrayBuffer();
-    return new Uint8Array(buffer);
+    return this.io.request<Uint8Array>('read', filePath);
   }
 
   public async copyFile(srcPath: string, destPath: string): Promise<void> {
@@ -216,22 +212,24 @@ export class FileSystemService {
   }
 
   public async copyDirectory(srcDir: string, destDir: string): Promise<void> {
+    srcDir = cleanNativePath(srcDir); destDir = cleanNativePath(destDir);
+    if (destDir === srcDir || !srcDir || destDir.startsWith(srcDir + '/')) throw new Error('Cannot copy a directory into itself');
     await this.createDirectory(destDir);
-    const items = await this.listFiles(srcDir);
+    // Copy actual entries, not the filtered/depth-limited explorer tree.
+    const items = await this.io.request<NativeEntry[]>('list', srcDir);
     for (const item of items) {
-      const cleanSrc = srcDir.replace(/^\/+|\/+$/g, '');
-      const relative = cleanSrc ? item.path.substring(cleanSrc.length).replace(/^\/+/, '') : item.path;
-      const targetPath = destDir ? `${destDir.replace(/^\/+|\/+$/g, '')}/${relative}` : relative;
-
-      if (item.isDirectory) {
-        await this.copyDirectory(item.path, targetPath);
+      const sourcePath = srcDir + '/' + item.name, targetPath = destDir ? destDir + '/' + item.name : item.name;
+      if (item.kind === 'directory') {
+        await this.copyDirectory(sourcePath, targetPath);
       } else {
-        await this.copyFile(item.path, targetPath);
+        await this.copyFile(sourcePath, targetPath);
       }
     }
   }
 
   public async move(srcPath: string, destPath: string): Promise<void> {
+    srcPath = cleanNativePath(srcPath); destPath = cleanNativePath(destPath);
+    if (srcPath === destPath) throw new Error('Source and destination must differ');
     const isDir = await this.directoryExists(srcPath);
     if (isDir) {
       await this.copyDirectory(srcPath, destPath);
@@ -243,85 +241,34 @@ export class FileSystemService {
   }
 
   public async writeFile(filePath: string, content: string): Promise<void> {
-    return this.enqueue(async () => {
-      const fileHandle = await this.resolveNativeFileHandle(filePath, true);
-      if (!fileHandle) {
-        throw new Error(`Could not create or write to file: ${filePath}`);
-      }
-      // @ts-ignore
-      const writable = await fileHandle.createWritable();
-      await writable.write(content);
-      await writable.close();
-    });
+    await this.writes.enqueue(cleanNativePath(filePath), content);
   }
 
   public async writeBinaryFile(filePath: string, data: Uint8Array): Promise<void> {
-    return this.enqueue(async () => {
-      const fileHandle = await this.resolveNativeFileHandle(filePath, true);
-      if (!fileHandle) {
-        throw new Error(`Could not create or write binary file: ${filePath}`);
-      }
-      // @ts-ignore
-      const writable = await fileHandle.createWritable();
-      await writable.write(data as any);
-      await writable.close();
-
-      const items = await this.listFiles();
-      this.notifyFilesChanged(items);
-    });
+    filePath = cleanNativePath(filePath);
+    await this.writes.enqueue(filePath, data.slice());
+    if (!filePath.split('/').some((name) => this.shouldIgnoreName(name))) this.refreshSoon();
   }
 
   public async createFile(filePath: string, initialContent?: string): Promise<void> {
-    return this.enqueue(async () => {
-      const content = initialContent !== undefined ? initialContent : this.getDefaultTemplateForFile(filePath);
-
-      const fileHandle = await this.resolveNativeFileHandle(filePath, true);
-      if (fileHandle) {
-        // @ts-ignore
-        const writable = await fileHandle.createWritable();
-        await writable.write(content);
-        await writable.close();
-      }
-
-      const items = await this.listFiles();
-      this.notifyFilesChanged(items);
-    });
+    await this.writeFile(filePath, initialContent ?? this.getDefaultTemplateForFile(filePath));
+    if (!filePath.split('/').some((name) => this.shouldIgnoreName(name))) this.refreshSoon();
   }
 
   public async createDirectory(dirPath: string): Promise<void> {
-    return this.enqueue(async () => {
-      if (!this.rootDirHandle) return;
-      const segments = dirPath.split('/').filter(Boolean);
-      let currentDir = this.rootDirHandle;
-      for (const seg of segments) {
-        currentDir = await currentDir.getDirectoryHandle(seg, { create: true });
-      }
-
-      const items = await this.listFiles();
-      this.notifyFilesChanged(items);
-    });
+    await this.io.request('mkdir', dirPath);
+    if (!dirPath.split('/').some((name) => this.shouldIgnoreName(name))) this.refreshSoon();
   }
 
   public async deleteFile(filePath: string): Promise<void> {
-    return this.enqueue(async () => {
-      if (!this.rootDirHandle) return;
-      const segments = filePath.split('/').filter(Boolean);
-      const fileName = segments.pop()!;
-      let currentDir = this.rootDirHandle;
-      for (const seg of segments) {
-        currentDir = await currentDir.getDirectoryHandle(seg);
-      }
-      await currentDir.removeEntry(fileName, { recursive: true });
-
-      const items = await this.listFiles();
-      this.notifyFilesChanged(items);
-    });
+    filePath = cleanNativePath(filePath);
+    await this.writes.flush(filePath);
+    await this.io.request('delete', filePath);
+    if (!filePath.split('/').some((name) => this.shouldIgnoreName(name))) this.refreshSoon();
   }
 
   public async renameFile(oldPath: string, newPath: string): Promise<void> {
-    const content = await this.readFile(oldPath);
-    await this.createFile(newPath, content);
-    await this.deleteFile(oldPath);
+    await this.move(oldPath, newPath);
   }
 
   private static readonly BINARY_EXTENSIONS = new Set([
@@ -335,41 +282,9 @@ export class FileSystemService {
     return !FileSystemService.BINARY_EXTENSIONS.has(ext);
   }
 
-  public async getAllFilesContent(): Promise<Record<string, string>> {
-    const result: Record<string, string> = {};
-    if (!this.rootDirHandle) return result;
-
-    const allFiles = await this.listFiles();
-    const gather = async (items: FileItem[]) => {
-      for (const item of items) {
-        if (item.isDirectory && item.children) {
-          await gather(item.children);
-        } else if (!item.isDirectory) {
-          if (this.shouldIgnoreName(item.name) || !this.isSourceOrTextFile(item.name)) continue;
-          try {
-            result[item.path] = await this.readFile(item.path);
-          } catch (e) {
-            console.warn(`Could not read file ${item.path}:`, e);
-          }
-        }
-      }
-    };
-    await gather(allFiles);
-    return result;
-  }
-
-  private async resolveNativeFileHandle(
-    filePath: string,
-    create: boolean
-  ): Promise<FileSystemFileHandle | null> {
-    if (!this.rootDirHandle) return null;
-    const segments = filePath.split('/').filter(Boolean);
-    const fileName = segments.pop()!;
-    let currentDir = this.rootDirHandle;
-    for (const seg of segments) {
-      currentDir = await currentDir.getDirectoryHandle(seg, { create });
-    }
-    return await currentDir.getFileHandle(fileName, { create });
+  public async getAllFilesContent(mainFile?: string, mode: 'single' | 'project' = 'project'): Promise<Record<string, string>> {
+    if (!this.hasOpenFolder()) return {};
+    return this.io.request('snapshot', '', { mainFile, mode, ignored: [...this.IGNORED_NAMES] });
   }
 
   public getDefaultTemplateForFile(filePath: string): string {

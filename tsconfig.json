@@ -8,6 +8,10 @@
 
     /* Bundler mode */
     "moduleResolution": "bundler",
+    "paths": {
+      "@emception-runtime/*": ["./node_modules/@gameguild/emception-browser/dist/*"],
+      "@clangd-broker": ["./node_modules/@algoproclub/clangd-wasm/lib/clangd.shared-worker.js"]
+    },
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
@@ -19,5 +23,5 @@
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src", "tests/browser.ts"]
 }

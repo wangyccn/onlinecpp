@@ -7,6 +7,8 @@ import { EmceptionService } from './services/emceptionService';
 import { ShellService } from './services/shellService';
 import { SimpleRouter } from './router';
 import { FileItem, OpenTab, DiagnosticItem, EditorSettings } from './types';
+import { abortable } from './services/abort';
+import { progressService } from './services/progressService';
 
 class OnlineCppIDE {
   private fileSystem: FileSystemService;
@@ -23,14 +25,18 @@ class OnlineCppIDE {
     minimap: true,
     wordWrap: 'on',
     cxxStandard: 'c++20',
-    optimization: '-O1',
+    optimization: '-O0',
     enableClangd: true,
     autoSave: true,
     wasmStorageMode: 'overwrite',
     buildMode: 'single',
+    storageMode: 'disk',
   };
 
   private isExecutingTask = false;
+  private taskAbort: AbortController | null = null;
+  private warmStarted = false;
+  private lastOutputPaths = new Map<string, string>();
 
   private currentDiagnostics: DiagnosticItem[] = [];
   private activePanelTab: 'terminal' | 'output' | 'problems' = 'terminal';
@@ -41,7 +47,7 @@ class OnlineCppIDE {
     this.editorService = new MonacoEditorService();
     this.clangdService = new ClangdService();
     this.terminalService = new TerminalService();
-    this.emceptionService = new EmceptionService(this.terminalService);
+    this.emceptionService = new EmceptionService(this.terminalService, this.fileSystem);
     this.router = new SimpleRouter();
 
     this.shellService = new ShellService({
@@ -60,6 +66,7 @@ class OnlineCppIDE {
       compileProject: () => this.compileCurrentProject(),
       runProject: () => this.runCurrentProject(),
       runOnly: () => this.runCachedWasmOnly(),
+      runBinary: (path, args) => this.runBinaryFromShell(path, args),
       navigateRoute: (hash) => this.router.navigate(hash),
     });
 
@@ -74,10 +81,6 @@ class OnlineCppIDE {
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        // If old default -O0 or -O2 was saved and user didn't explicitly customize it, default to fast -O1
-        if ((parsed.optimization === '-O2' || parsed.optimization === '-O0') && !localStorage.getItem('onlinecpp_opt_explicit')) {
-          parsed.optimization = '-O1';
-        }
         this.settings = { ...this.settings, ...parsed };
       } catch (e) {
         console.warn('Failed to parse settings:', e);
@@ -88,6 +91,7 @@ class OnlineCppIDE {
   private saveSettings(): void {
     localStorage.setItem('onlinecpp_settings', JSON.stringify(this.settings));
     this.editorService.applySettings(this.settings);
+    this.clangdService.configure(this.settings.cxxStandard, this.settings.enableClangd);
   }
 
   private renderLayout(): void {
@@ -120,6 +124,7 @@ class OnlineCppIDE {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 12-8.5 8.5c-.83.83-2.17.83-3 0 0 0 0 0 0 0a2.12 2.12 0 0 1 0-3L12 9"/><path d="M17.64 15 22 10.64"/><path d="m20.91 3.26-6.5 6.5"/></svg>
             <span>Compile</span>
           </button>
+          <button id="btn-stop" class="action-btn" title="Interrupt foreground task (Ctrl+C)" disabled>■ Stop</button>
           <button id="btn-save" class="action-btn" title="Save file (Ctrl+S)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
             <span>Save</span>
@@ -279,6 +284,7 @@ class OnlineCppIDE {
         <div class="status-right">
           <div class="status-item" id="status-cursor">Ln 1, Col 1</div>
           <div class="status-item" id="status-autosave" title="Auto-Save status">Auto-Save: On</div>
+          <button type="button" class="status-item" id="status-storage" title="Click to save and synchronize pending files to disk" style="background:none;border:0;color:inherit;font:inherit;cursor:pointer">Disk synced</button>
           <div class="status-item" title="Tab Indentation">Spaces: 4</div>
           <div class="status-item" title="File Encoding">UTF-8</div>
           <div class="status-item" id="status-std" title="C++ Standard">C++20</div>
@@ -292,6 +298,11 @@ class OnlineCppIDE {
   }
 
   private async initServices(): Promise<void> {
+    this.clangdService.configure(this.settings.cxxStandard, this.settings.enableClangd);
+
+    // Mount progress bar
+    progressService.mount();
+
     // 1. Mount Monaco Editor
     const monacoRoot = document.getElementById('monaco-root');
     if (monacoRoot) {
@@ -314,10 +325,18 @@ class OnlineCppIDE {
 
     // 4. Editor Save Handler
     this.editorService.setOnSave(async (path, content) => {
+      if (!this.fileSystem.hasOpenFolder()) throw new Error('Open a local folder before saving');
       if (this.fileSystem.hasOpenFolder()) {
         await this.fileSystem.writeFile(path, content);
-        this.logOutput(`[Saved] File "${path}" saved to local disk.`);
+        this.logOutput(`[Saved to IndexedDB] "${path}"${this.fileSystem.getStorageMode() === 'disk' ? ' — external disk sync queued.' : ' — browser storage only.'}`);
+        this.updateStatus();
       }
+    });
+
+    this.editorService.onSaveError((path, error: any) => {
+      this.logOutput(`[Save failed] ${path}: ${error.message || error}. Changes remain unsaved.`);
+      const status = document.getElementById('status-autosave');
+      if (status) { status.textContent = 'Save failed — retry Ctrl+S'; status.title = String(error); }
     });
 
     // 5. Update Cursor Position in Status Bar
@@ -328,6 +347,7 @@ class OnlineCppIDE {
 
     // 6. Refresh Tabs UI
     this.editorService.onTabsChanged((tabs, activePath) => {
+      this.clangdService.retainDocuments(tabs.map((tab) => tab.path));
       this.renderTabs(tabs, activePath);
       this.updateBreadcrumbs(activePath);
       this.updateEditorWelcomeState(tabs.length);
@@ -341,6 +361,32 @@ class OnlineCppIDE {
     });
 
     // 8. Handle Clangd Diagnostics
+    let lastStorageError = '';
+    let diskSyncTask: ReturnType<typeof progressService.start> | undefined;
+    const diskSyncLabel = (pending: number) => `Syncing ${pending} file${pending === 1 ? '' : 's'} to disk...`;
+    const finishDiskSync = () => { diskSyncTask?.done(); diskSyncTask = undefined; };
+    this.fileSystem.io.onStorageStatus = (status) => {
+      this.updateStatus();
+      if (status.error && status.error !== lastStorageError) this.logOutput('[Disk sync failed] ' + status.error + '. Data is safe in IndexedDB — click the disk status to retry.');
+      lastStorageError = status.error || '';
+      // The task must always be released: a leaked one keeps the bar spinning forever and blocks closing the tab.
+      if (status.mode === 'browser' || status.pending === 0 || status.error) { finishDiskSync(); return; }
+      if (diskSyncTask) diskSyncTask.update(-1, diskSyncLabel(status.pending));
+      else diskSyncTask = progressService.start('disk-sync', diskSyncLabel(status.pending), -1);
+    };
+    document.getElementById('status-storage')?.addEventListener('click', async () => {
+      const task = progressService.start('manual-disk-sync', 'Syncing files to disk...', -1);
+      try { await this.editorService.saveAllFiles(); await this.fileSystem.syncToDisk(); this.logOutput('[Disk sync] All pending files written to disk.'); }
+      catch (error: any) { this.logOutput('[Sync failed] ' + (error?.message || error)); }
+      finally { task.done(); this.updateStatus(); }
+    });
+    window.addEventListener('beforeunload', (event) => {
+      // Only unsaved editor content blocks closing: the write-back cache survives a reload.
+      if (this.editorService.hasUnsavedChanges()) {
+        event.preventDefault(); event.returnValue = '';
+      }
+    });
+
     this.clangdService.onDiagnostics((items) => {
       this.currentDiagnostics = items;
       this.renderDiagnostics(items);
@@ -371,15 +417,33 @@ class OnlineCppIDE {
       this.renderNoFolderState();
     }
 
-    // 12. Preload Emception Toolchain in background
-    setTimeout(() => {
-      this.emceptionService.init().then((ready) => {
-        const toolchainEl = document.getElementById('status-toolchain');
-        if (toolchainEl) {
-          toolchainEl.textContent = ready ? 'Emception: Ready' : 'Emception: Standby';
-        }
+    if (this.settings.storageMode === 'browser') {
+      void this.fileSystem.useBrowserStorage().then(() => this.showCurrentWorkspace()).catch((error) => {
+        this.logOutput('[Browser storage failed] ' + error.message);
       });
-    }, 100);
+    }
+
+    // 12. Warm the Emception toolchain in the background (no UI entry point needed:
+    // the toolchain is fetched automatically once a workspace exists).
+    const idle = (window as any).requestIdleCallback as ((cb: () => void, opts?: { timeout: number }) => void) | undefined;
+    if (idle) idle(() => void this.warmToolchain(), { timeout: 2500 });
+    else setTimeout(() => void this.warmToolchain(), 600);
+  }
+
+  /** Fetch + boot the Clang/WASM toolchain ahead of the first build. */
+  private warmToolchain(): Promise<boolean> | null {
+    if (!this.fileSystem.hasOpenFolder() || this.warmStarted) return null;
+    this.warmStarted = true;
+    const task = progressService.start('toolchain-download', 'Preparing C++ toolchain…', -1);
+    return this.emceptionService.prepare(this.settings.cxxStandard, this.settings.optimization).then((ready) => {
+      const toolchainEl = document.getElementById('status-toolchain');
+      if (toolchainEl) toolchainEl.textContent = ready ? 'Emception: Ready' : 'Emception: Standby';
+      if (ready) this.terminalService.writeLine('\x1b[32m[Toolchain] C++ toolchain ready.\x1b[0m');
+      return ready;
+    }).catch((error: any) => {
+      this.terminalService.writeLine(`\x1b[33m[Toolchain] Warm-up skipped: ${error?.message || error}\x1b[0m`);
+      return false;
+    }).finally(() => { task.done(); this.warmStarted = false; });
   }
 
   private updateEditorWelcomeState(openTabCount: number): void {
@@ -443,6 +507,7 @@ class OnlineCppIDE {
   }
 
   private bindEvents(): void {
+    document.getElementById('btn-stop')?.addEventListener('click', () => this.interruptExecution());
     // Run Button
     document.getElementById('btn-run')?.addEventListener('click', () => this.runCurrentProject());
 
@@ -454,7 +519,8 @@ class OnlineCppIDE {
 
     // Save Button
     document.getElementById('btn-save')?.addEventListener('click', async () => {
-      await this.editorService.saveActiveFile();
+      try { await this.editorService.saveActiveFile(); }
+      catch (error: any) { this.logOutput(`[Save failed] ${error.message || error}. Changes remain unsaved.`); }
     });
 
     // Open Local Folder Buttons
@@ -590,8 +656,17 @@ class OnlineCppIDE {
   }
 
   private async openFolderAction(): Promise<void> {
-    const ok = await this.fileSystem.openNativeDirectory();
+    if (this.isExecutingTask || this.emceptionService.isBusy()) return;
+    try { await this.editorService.saveAllFiles(); } catch (error) { this.logOutput('[Folder] Save failed; keeping the current folder open.'); return; }
+    const ok = await this.fileSystem.openNativeDirectory(async () => {
+      await this.editorService.saveAllFiles();
+      this.editorService.resetWorkspace();
+      this.clangdService.resetWorkspace();
+      this.emceptionService.resetWorkspace();
+      this.lastOutputPaths.clear();
+    });
     if (ok) {
+      this.settings.storageMode = 'disk'; this.saveSettings();
       this.logOutput(`[FileSystem] Opened local native folder: "${this.fileSystem.getRootName()}"`);
       const files = await this.fileSystem.listFiles();
       this.renderFileTree(files);
@@ -611,7 +686,17 @@ class OnlineCppIDE {
           this.clangdService.attachDocument('file:///main.cpp', content);
         }
       }
+      void this.warmToolchain();
     }
+  }
+
+  private async showCurrentWorkspace(): Promise<void> {
+    const files = await this.fileSystem.listFiles(); this.renderFileTree(files);
+    const title = document.getElementById('project-name'); if (title) title.textContent = this.fileSystem.getRootName();
+    const source = this.findFirstCppFile(files);
+    if (source) this.editorService.openFile(source.path, await this.fileSystem.readFile(source.path));
+    this.updateStatus();
+    void this.warmToolchain();
   }
 
   private findFirstCppFile(items: FileItem[]): FileItem | null {
@@ -678,6 +763,8 @@ class OnlineCppIDE {
     const btnRun = document.getElementById('btn-run') as HTMLButtonElement | null;
     const btnRunOnly = document.getElementById('btn-run-only') as HTMLButtonElement | null;
     const btnCompile = document.getElementById('btn-compile') as HTMLButtonElement | null;
+    const stop = document.getElementById('btn-stop') as HTMLButtonElement | null;
+    if (stop) stop.disabled = !busy;
     if (btnRun) {
       btnRun.disabled = busy;
       btnRun.classList.toggle('disabled', busy);
@@ -692,285 +779,123 @@ class OnlineCppIDE {
     }
   }
 
-  private async exportWasmToFolder(activePath: string, wasmBytes: Uint8Array): Promise<string> {
-    const baseName = activePath.split('/').pop()?.replace(/\.[^.]+$/, '') || 'program';
-    let wasmFileName: string;
-
-    if (this.settings.wasmStorageMode === 'timestamp') {
-      const now = new Date();
-      const pad = (n: number) => n.toString().padStart(2, '0');
-      const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-      wasmFileName = `${baseName}_${ts}.wasm`;
-    } else {
-      wasmFileName = `${baseName}.wasm`;
-    }
-
-    try {
-      await this.fileSystem.writeBinaryFile(wasmFileName, wasmBytes);
-      const msg = `[Storage] Exported ${wasmFileName} (${(wasmBytes.length / 1024).toFixed(1)} KB) to folder (${this.settings.wasmStorageMode === 'timestamp' ? 'Timestamp' : 'Overwrite'} mode).`;
-      this.terminalService.writeLine(`\x1b[32m${msg}\x1b[0m`);
-      this.logOutput(msg);
-    } catch (e: any) {
-      console.warn('Failed to export WASM file:', e);
-      this.terminalService.writeLine(`\x1b[33m[Warning] Could not export WASM to folder: ${e.message}\x1b[0m`);
-    }
-
-    return wasmFileName;
+  private getWasmOutputPath(activePath: string): string {
+    const base = activePath.replace(/\.[^/.]+$/, '');
+    return this.settings.wasmStorageMode === 'timestamp'
+      ? `${base}_${new Date().toISOString().replace(/[-:TZ.]/g, '')}.wasm`
+      : `${base}.wasm`;
   }
 
-  private async runCurrentProject(): Promise<void> {
-    if (this.isExecutingTask) {
-      this.terminalService.writeLine('\x1b[33m[Warning] A build or execution task is already in progress. Please wait...\x1b[0m');
-      return;
-    }
+  private async runCurrentProject(): Promise<void> { await this.buildCurrentProject(true); }
+  private async compileCurrentProject(): Promise<void> { await this.buildCurrentProject(false); }
 
+  private beginExecution(): { signal: AbortSignal; end: () => void } | null {
+    if (this.isExecutingTask || this.emceptionService.isBusy()) return null;
     this.isExecutingTask = true;
+    const controller = this.taskAbort = new AbortController();
     this.setExecutionButtonsState(true);
+    this.clangdService.setPaused(true);
+    const release = this.terminalService.beginTask(() => this.interruptExecution());
+    return { signal: controller.signal, end: () => {
+      this.taskAbort = null; this.isExecutingTask = false;
+      this.setExecutionButtonsState(false); this.clangdService.setPaused(false); release();
+    } };
+  }
 
+  private interruptExecution(): void {
+    this.taskAbort?.abort();
+    this.emceptionService.stop();
+  }
+
+  private async buildCurrentProject(run: boolean): Promise<void> {
+    if (!this.fileSystem.hasOpenFolder()) { await this.openFolderAction(); return; }
+    const activePath = this.editorService.getActivePath();
+    if (!activePath) return;
+    const task = this.beginExecution(); if (!task) return;
+    const progress = progressService.start('build', run ? 'Building & Running...' : 'Compiling...', -1);
     try {
-      if (!this.fileSystem.hasOpenFolder()) {
-        alert('请先点击 "Open Folder" 选择一个本地 C++ 项目文件夹。');
-        await this.openFolderAction();
-        return;
-      }
-
-      const activePath = this.editorService.getActivePath();
-      if (!activePath) {
-        alert('请在左侧文件列表中打开一个 C++ 文件。');
-        return;
-      }
-
-      this.switchPanelTab('terminal');
-      this.terminalService.focus();
-      await this.editorService.saveActiveFile();
-
-      const allFiles = await this.fileSystem.getAllFilesContent();
-
-      // Ensure open editor tabs and active model override disk content
-      const openModels = this.editorService.getAllOpenModelsContent();
-      for (const [openPath, openContent] of Object.entries(openModels)) {
-        allFiles[openPath] = openContent;
-      }
-      const activeContent = this.editorService.getActiveContent();
-      if (activeContent !== null) {
-        allFiles[activePath] = activeContent;
-      }
-
-      this.logOutput(`[Build & Run] Starting compilation of ${activePath}...`);
-
-      // 1. Compile
+      this.switchPanelTab('terminal'); this.terminalService.focus();
+      await abortable(this.editorService.saveAllFiles(), task.signal);
+      await abortable(this.fileSystem.flush(), task.signal);
+      progress.update(15, 'Reading source files...');
+      const allFiles = await abortable(this.fileSystem.getAllFilesContent(activePath, this.settings.buildMode), task.signal);
+      task.signal.throwIfAborted();
+      Object.assign(allFiles, this.editorService.getDirtyModelsContent());
+      progress.update(30, 'Compiling with Clang...');
       const result = await this.emceptionService.compile(activePath, allFiles, {
-        standard: this.settings.cxxStandard,
-        optimization: this.settings.optimization,
-        buildMode: this.settings.buildMode,
+        standard: this.settings.cxxStandard, optimization: this.settings.optimization,
+        buildMode: this.settings.buildMode, outputPath: this.getWasmOutputPath(activePath), signal: task.signal,
       });
-
-      // Update diagnostics
-      const activeModel = this.editorService.getActiveModel();
-      if (activeModel) {
-        if (result.stderr || result.stdout) {
-          this.clangdService.updateMarkersFromCompilerOutput(activeModel, result.stderr || result.stdout);
-        } else if (result.exitCode === 0) {
-          this.clangdService.clearMarkers(activeModel);
-        }
+      if (result.exitCode === 130 || task.signal.aborted) return;
+      const model = this.editorService.getActiveModel();
+      if (model) {
+        if (result.stderr || result.stdout) this.clangdService.updateMarkersFromCompilerOutput(model, result.stderr || result.stdout);
+        else if (result.exitCode === 0) this.clangdService.clearMarkers(model);
       }
-
-      if (result.exitCode !== 0) {
-        this.logOutput(`[Build Failed] Compilation errors detected. Check Problems / Terminal tab.`);
-        // Ensure terminal returns to command prompt on compile or link failure!
-        this.terminalService.showPrompt();
-        return;
+      if (result.exitCode !== 0) { this.logOutput(`[Build failed] ${result.stderr}`); return; }
+      this.lastOutputPaths.set(activePath, result.outputPath!);
+      this.logOutput(`[Build] ${result.outputPath} — ${result.durationMs.toFixed(1)}ms (IndexedDB committed${this.fileSystem.getStorageMode() === 'disk' ? ', disk sync queued' : ', browser storage only'})`);
+      if (run) {
+        progress.update(80, 'Running program...');
+        await this.emceptionService.runWasmBinary(result.outputPath, result.wasmBytes, { signal: task.signal, module: result.wasmModule });
+        await this.refreshOpenFiles();
       }
-
-      // Export WASM binary to local folder
-      let wasmTarget = 'program.wasm';
-      if (result.wasmBytes) {
-        wasmTarget = await this.exportWasmToFolder(activePath, result.wasmBytes);
+      progress.update(100, 'Done');
+      this.renderFileTree(await this.fileSystem.listFiles());
+    } catch (error: any) {
+      if (error.name !== 'AbortError') {
+        this.terminalService.writeLine(`\x1b[31m[Task] ${error.message || error}\x1b[0m`);
+        this.logOutput(`[Task failed] ${error.message || error}`);
       }
-
-      // 2. Run generated WASM
-      this.logOutput(`[Execution] Launching WebAssembly binary...`);
-      this.terminalService.focus();
-      await this.emceptionService.runWasmBinary(wasmTarget, result.wasmBytes);
-    } finally {
-      this.isExecutingTask = false;
-      this.setExecutionButtonsState(false);
-    }
+    } finally { task.end(); progress.done(); }
   }
 
   private async runCachedWasmOnly(): Promise<void> {
-    if (this.isExecutingTask) {
-      this.terminalService.writeLine('\x1b[33m[Warning] A build or execution task is already in progress. Please wait...\x1b[0m');
-      return;
-    }
-
-    this.isExecutingTask = true;
-    this.setExecutionButtonsState(true);
-
+    if (!this.fileSystem.hasOpenFolder()) { await this.openFolderAction(); return; }
+    const task = this.beginExecution(); if (!task) return;
+    const progress = progressService.start('run-only', 'Loading cached WASM...', -1);
     try {
-      this.switchPanelTab('terminal');
-      this.terminalService.focus();
-
-      const activePath = this.editorService.getActivePath();
-      const baseName = activePath ? activePath.split('/').pop()?.replace(/\.[^.]+$/, '') : null;
-
-      let wasmBytes: Uint8Array | null = null;
-      let wasmName = 'program.wasm';
-
-      // 1. If project folder is open, check workspace for matching .wasm
-      if (this.fileSystem.hasOpenFolder()) {
-        const candidateNames: string[] = [];
-        if (baseName) {
-          candidateNames.push(`${baseName}.wasm`);
-        }
-        candidateNames.push('program.wasm');
-
-        for (const candidate of candidateNames) {
-          try {
-            if (await this.fileSystem.fileExists(candidate)) {
-              wasmBytes = await this.fileSystem.readBinaryFile(candidate);
-              wasmName = candidate;
-              break;
-            }
-          } catch {
-            // continue
-          }
-        }
-
-        // Check if there are timestamped wasm files (e.g. main_20261107_...wasm)
-        if (!wasmBytes) {
-          try {
-            const allFiles = await this.fileSystem.listFiles();
-            const wasmFiles = allFiles.filter((f) => !f.isDirectory && f.name.endsWith('.wasm'));
-            if (wasmFiles.length > 0) {
-              const matched = baseName ? wasmFiles.find((f) => f.name.startsWith(baseName)) : undefined;
-              const target = matched || wasmFiles[0];
-              wasmBytes = await this.fileSystem.readBinaryFile(target.path);
-              wasmName = target.name;
-            }
-          } catch {
-            // ignore
-          }
-        }
+      this.switchPanelTab('terminal'); this.terminalService.focus();
+      await abortable(this.editorService.saveAllFiles(), task.signal);
+      progress.update(20, 'Locating WASM binary...');
+      const active = this.editorService.getActivePath();
+      let target = active ? this.lastOutputPaths.get(active) || active.replace(/\.[^/.]+$/, '') + '.wasm' : 'program.wasm';
+      if (!await this.fileSystem.fileExists(target) && active) {
+        const parent = active.split('/').slice(0, -1).join('/');
+        const base = active.split('/').pop()!.replace(/\.[^.]+$/, '');
+        const candidates = (await this.fileSystem.listFiles(parent)).filter((file) => !file.isDirectory && file.name.startsWith(base + '_') && file.name.endsWith('.wasm'));
+        candidates.sort((a, b) => b.name.localeCompare(a.name));
+        if (candidates[0]) target = candidates[0].path;
       }
+      task.signal.throwIfAborted();
+      progress.update(50, 'Running program...');
+      await this.emceptionService.runWasmBinary(target, undefined, { signal: task.signal });
+      await this.refreshOpenFiles();
+      progress.update(100, 'Done');
+      this.renderFileTree(await this.fileSystem.listFiles());
+    } catch (error: any) {
+      if (error.name !== 'AbortError') this.terminalService.writeLine(`\x1b[31m[Run] ${error.message || error}\x1b[0m`);
+    } finally { task.end(); progress.done(); }
+  }
 
-      // 2. Check in-memory last compiled WASM
-      if (!wasmBytes) {
-        wasmBytes = this.emceptionService.getLastCompiledWasm();
-        if (wasmBytes) {
-          wasmName = baseName ? `${baseName}.wasm` : 'program.wasm';
-        }
-      }
-
-      // 3. Check Emception VFS /home/user/program.wasm or /home/user/${cleanWasmName}
-      if (!wasmBytes) {
-        const vfsCandidates = baseName ? [`/home/user/${baseName}.wasm`, '/home/user/program.wasm'] : ['/home/user/program.wasm'];
-        for (const vfsPath of vfsCandidates) {
-          wasmBytes = await this.emceptionService.readVfsFile(vfsPath);
-          if (wasmBytes) {
-            wasmName = vfsPath.split('/').pop() || 'program.wasm';
-            break;
-          }
-        }
-      }
-
-      if (!wasmBytes || wasmBytes.byteLength === 0) {
-        const targetHint = baseName ? ` for "${baseName}"` : '';
-        this.terminalService.writeLine(
-          `\r\n\x1b[33m[Run Only] 未找到已编译的 WebAssembly 模块${targetHint}。\x1b[0m\r\n` +
-          `\x1b[90m提示：请先点击 "Run" (F5) 或 "Compile" (Ctrl+B) 进行编译构建。\x1b[0m\r\n`
-        );
-        this.terminalService.showPrompt();
-        return;
-      }
-
-      this.terminalService.writeLine(
-        `\r\n\x1b[32m[Run Only] 正在直接运行缓存的 WASM 模块: ${wasmName} (${(wasmBytes.length / 1024).toFixed(1)} KB，跳过编译)...\x1b[0m`
-      );
-      this.logOutput(`[Run Only] Launching cached binary: ${wasmName} (${(wasmBytes.length / 1024).toFixed(1)} KB)...`);
-
-      await this.emceptionService.runWasmBinary(wasmName, wasmBytes);
-    } catch (err: any) {
-      this.terminalService.writeLine(`\x1b[31m[Run Only Error] ${err.message || String(err)}\x1b[0m`);
-      this.terminalService.showPrompt();
-    } finally {
-      this.isExecutingTask = false;
-      this.setExecutionButtonsState(false);
+  private async refreshOpenFiles(): Promise<void> {
+    for (const tab of this.editorService.getOpenTabs()) if (!tab.isDirty && this.fileSystem.isSourceOrTextFile(tab.name)) {
+      try { this.editorService.updateFileFromDisk(tab.path, await this.fileSystem.readFile(tab.path)); } catch { /* Files may have been removed by the program. */ }
     }
   }
 
-  private async compileCurrentProject(): Promise<void> {
-    if (this.isExecutingTask) {
-      this.terminalService.writeLine('\x1b[33m[Warning] A build task is already in progress. Please wait...\x1b[0m');
-      return;
-    }
-
-    this.isExecutingTask = true;
-    this.setExecutionButtonsState(true);
-
+  private async runBinaryFromShell(path: string, args: string[]): Promise<void> {
+    const task = this.beginExecution(); if (!task) return;
+    const progress = progressService.start('run-binary', 'Running program...', -1);
     try {
-      if (!this.fileSystem.hasOpenFolder()) {
-        alert('请先点击 "Open Folder" 选择一个本地 C++ 项目文件夹。');
-        await this.openFolderAction();
-        return;
-      }
-
-      const activePath = this.editorService.getActivePath();
-      if (!activePath) {
-        alert('请在左侧文件列表中打开一个 C++ 文件。');
-        return;
-      }
-
-      this.switchPanelTab('output');
-      await this.editorService.saveActiveFile();
-
-      const allFiles = await this.fileSystem.getAllFilesContent();
-
-      // Ensure open editor tabs and active model override disk content
-      const openModels = this.editorService.getAllOpenModelsContent();
-      for (const [openPath, openContent] of Object.entries(openModels)) {
-        allFiles[openPath] = openContent;
-      }
-      const activeContent = this.editorService.getActiveContent();
-      if (activeContent !== null) {
-        allFiles[activePath] = activeContent;
-      }
-
-      const result = await this.emceptionService.compile(activePath, allFiles, {
-        standard: this.settings.cxxStandard,
-        optimization: this.settings.optimization,
-        buildMode: this.settings.buildMode,
-      });
-
-      this.logOutput(`\n--- Compiler Output ---`);
-      if (result.stdout) this.logOutput(result.stdout);
-      if (result.stderr) this.logOutput(result.stderr);
-
-      const activeModel = this.editorService.getActiveModel();
-      if (activeModel) {
-        if (result.stderr || result.stdout) {
-          this.clangdService.updateMarkersFromCompilerOutput(activeModel, result.stderr || result.stdout);
-        } else if (result.exitCode === 0) {
-          this.clangdService.clearMarkers(activeModel);
-        }
-      }
-
-      if (result.exitCode === 0) {
-        if (result.wasmBytes) {
-          await this.exportWasmToFolder(activePath, result.wasmBytes);
-        }
-        this.logOutput(`[Success] C++ code successfully compiled to WebAssembly in ${result.durationMs.toFixed(1)}ms!`);
-      } else {
-        this.logOutput(`[Failed] Compilation failed with exit code ${result.exitCode}.`);
-        this.switchPanelTab('problems');
-      }
-
-      // Always restore terminal prompt when compilation completes
-      this.terminalService.showPrompt();
-    } finally {
-      this.isExecutingTask = false;
-      this.setExecutionButtonsState(false);
-    }
+      await abortable(this.editorService.saveAllFiles(), task.signal);
+      await this.emceptionService.runWasmBinary(path, undefined, { signal: task.signal, args, cwd: this.terminalService.getCwd() });
+      await this.refreshOpenFiles();
+      progress.update(100, 'Done');
+      this.renderFileTree(await this.fileSystem.listFiles());
+    } catch (error: any) {
+      if (error.name !== 'AbortError') this.terminalService.writeLine('Run failed: ' + (error.message || error));
+    } finally { task.end(); progress.done(); }
   }
 
   private resolveCwdPath(inputPath: string): string {
@@ -1077,6 +1002,9 @@ class OnlineCppIDE {
         ${iconSvg}
         <span class="tree-name">${item.name}</span>
         <div class="tree-actions">
+          <button class="tree-action-btn btn-export-file" title="Export to external file system">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </button>
           <button class="tree-action-btn btn-delete-file" title="Delete">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
           </button>
@@ -1087,9 +1015,18 @@ class OnlineCppIDE {
         const target = e.target as HTMLElement;
         if (target.closest('.btn-delete-file')) {
           e.stopPropagation();
-          if (confirm(`Delete "${item.name}"?`)) {
-            await this.fileSystem.deleteFile(item.path);
-            this.editorService.closeTab(item.path);
+            if (confirm(`Delete "${item.name}"?`)) {
+              try {
+                await this.editorService.closeTabsUnder(item.path);
+                await this.fileSystem.deleteFile(item.path);
+              } catch (error: any) { this.logOutput(`[Delete] ${error.message || error}`); }
+            }
+          return;
+        }
+        if (target.closest('.btn-export-file')) {
+          e.stopPropagation();
+          if (!item.isDirectory) {
+            await this.exportFile(item.path);
           }
           return;
         }
@@ -1197,6 +1134,11 @@ class OnlineCppIDE {
     const autoSaveEl = document.getElementById('status-autosave');
     if (autoSaveEl) {
       autoSaveEl.textContent = this.settings.autoSave ? 'Auto-Save: On' : 'Auto-Save: Off';
+    }
+    const storage = this.fileSystem.io.storageStatus, storageEl = document.getElementById('status-storage');
+    if (storageEl) {
+      storageEl.textContent = storage.mode === 'browser' ? 'IndexedDB only' : storage.error ? 'Disk sync failed — retry' : storage.pending ? `Disk sync: ${storage.pending} pending` : 'Disk synced';
+      storageEl.title = storage.error || (storage.mode === 'browser' ? '无需存储磁盘：文件只保存在此浏览器的 IndexedDB。清除站点数据会删除文件。' : '写入已先保存至 IndexedDB；点击立即同步到外部磁盘。');
     }
   }
 
@@ -1339,6 +1281,39 @@ class OnlineCppIDE {
     });
   }
 
+  private async exportFile(filePath: string): Promise<void> {
+    try {
+      const bytes = await this.fileSystem.readBinaryFile(filePath);
+      const name = filePath.split('/').pop() || 'export.bin';
+      // Try File System Access API save picker first
+      const savePicker = (window as any).showSaveFilePicker;
+      if (savePicker) {
+        try {
+          const handle = await savePicker({ suggestedName: name });
+          const writable = await handle.createWritable();
+          await writable.write(bytes);
+          await writable.close();
+          this.logOutput(`[Export] Saved "${filePath}" to external file system as "${handle.name}".`);
+          return;
+        } catch (e: any) {
+          if (e.name === 'AbortError') return;
+          // Fall through to download fallback
+        }
+      }
+      // Fallback: trigger browser download
+      const blob = new Blob([bytes.buffer as ArrayBuffer], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      this.logOutput(`[Export] Downloaded "${filePath}" as "${name}".`);
+    } catch (error: any) {
+      this.logOutput(`[Export] Failed: ${error.message || error}`);
+    }
+  }
+
   private openSettingsModal(): void {
     const modal = document.getElementById('modal-container');
     if (!modal) return;
@@ -1361,8 +1336,17 @@ class OnlineCppIDE {
             </div>
 
             <div class="form-group">
+              <label class="form-label" for="setting-storage-mode">文件存储模式 (File Storage)</label>
+              <span class="form-desc">本地模式先保存到 IndexedDB，再合并异步写盘；无需存储磁盘模式使用独立浏览器工作区，不自动迁移本地文件。清除站点数据会删除浏览器工作区及未同步的数据。</span>
+              <select id="setting-storage-mode" class="form-control">
+                <option value="disk" ${this.settings.storageMode === 'disk' ? 'selected' : ''}>本地磁盘 + IndexedDB 写回缓存（推荐）</option>
+                <option value="browser" ${this.settings.storageMode === 'browser' ? 'selected' : ''}>无需存储磁盘（仅 IndexedDB）</option>
+              </select>
+            </div>
+
+            <div class="form-group">
               <label class="form-label">WASM 二进制导出方式 (WASM Storage Mode)</label>
-              <span class="form-desc">编译成功后将 .wasm 二进制保存到本地打开的文件夹中。</span>
+              <span class="form-desc">编译成功后将 .wasm 保存到当前工作区；本地模式后台异步写盘。</span>
               <select id="setting-wasm-storage" class="form-control">
                 <option value="overwrite" ${this.settings.wasmStorageMode === 'overwrite' ? 'selected' : ''}>覆盖存储 (如 main.wasm - 推荐)</option>
                 <option value="timestamp" ${this.settings.wasmStorageMode === 'timestamp' ? 'selected' : ''}>按时间戳存储 (如 main_20261107_0850.wasm)</option>
@@ -1371,7 +1355,7 @@ class OnlineCppIDE {
 
             <div class="form-group">
               <label class="form-label">自动保存 (Auto-Save)</label>
-              <span class="form-desc">代码编辑后 1 秒防抖自动写回本地文件。</span>
+              <span class="form-desc">停止编辑 800ms 后合并保存；IndexedDB 事务成功后移除未保存标记，外部磁盘同步状态单独显示。点击底部磁盘状态可立即同步。</span>
               <select id="setting-auto-save" class="form-control">
                 <option value="true" ${this.settings.autoSave ? 'selected' : ''}>开启 (Auto-Save On - Recommended)</option>
                 <option value="false" ${!this.settings.autoSave ? 'selected' : ''}>关闭 (仅按 Ctrl+S 手动保存)</option>
@@ -1392,8 +1376,8 @@ class OnlineCppIDE {
             <div class="form-group">
               <label class="form-label">Compiler Optimization Flag</label>
               <select id="setting-opt" class="form-control">
-                <option value="-O1" ${this.settings.optimization === '-O1' ? 'selected' : ''}>-O1 (Fastest In-Browser Build & Link, Recommended)</option>
-                <option value="-O0" ${this.settings.optimization === '-O0' ? 'selected' : ''}>-O0 (No Optimization, Large Binary)</option>
+                <option value="-O0" ${this.settings.optimization === '-O0' ? 'selected' : ''}>-O0 (Fast Build, No Optimization — Default)</option>
+                <option value="-O1" ${this.settings.optimization === '-O1' ? 'selected' : ''}>-O1 (Balanced Build Time & Runtime Speed)</option>
                 <option value="-O2" ${this.settings.optimization === '-O2' ? 'selected' : ''}>-O2 (Release Optimization, Slower Build)</option>
                 <option value="-O3" ${this.settings.optimization === '-O3' ? 'selected' : ''}>-O3 (Aggressive Optimization)</option>
               </select>
@@ -1419,6 +1403,21 @@ class OnlineCppIDE {
                 <option value="false" ${!this.settings.minimap ? 'selected' : ''}>Disabled</option>
               </select>
             </div>
+
+            <div class="form-group">
+              <label class="form-label">清理空间 (Storage Cleanup)</label>
+              <span class="form-desc">清理构建缓存（WASM、.o 文件等）或全部 IndexedDB 内容。不会影响已导出文件和本地文件系统。</span>
+              <div class="cleanup-section" style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button id="btn-clear-cache" class="cleanup-btn btn-clear-cache" title="Delete .wasm, .o, .a and build cache from IndexedDB">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                  <span>清理构建缓存</span>
+                </button>
+                <button id="btn-clear-all-storage" class="cleanup-btn btn-clear-all" title="Delete ALL IndexedDB data (files, cache, settings remain)">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+                  <span>清空全部 IndexedDB</span>
+                </button>
+              </div>
+            </div>
           </div>
           <div class="modal-footer">
             <button id="btn-save-settings" class="action-btn btn-run">Save & Apply</button>
@@ -1427,7 +1426,9 @@ class OnlineCppIDE {
       </div>
     `;
 
-    document.getElementById('btn-save-settings')?.addEventListener('click', () => {
+    document.getElementById('btn-save-settings')?.addEventListener('click', async () => {
+      if (this.isExecutingTask || this.emceptionService.isBusy()) { alert('请等待或中断当前任务后再修改设置。'); return; }
+      const storageMode = (document.getElementById('setting-storage-mode') as HTMLSelectElement).value as 'disk' | 'browser';
       const bm = (document.getElementById('setting-build-mode') as HTMLSelectElement).value as any;
       const wsm = (document.getElementById('setting-wasm-storage') as HTMLSelectElement).value as any;
       const as = (document.getElementById('setting-auto-save') as HTMLSelectElement).value === 'true';
@@ -1436,8 +1437,23 @@ class OnlineCppIDE {
       const fz = parseInt((document.getElementById('setting-fontsize') as HTMLInputElement).value, 10);
       const tab = parseInt((document.getElementById('setting-tabsize') as HTMLSelectElement).value, 10);
       const mm = (document.getElementById('setting-minimap') as HTMLSelectElement).value === 'true';
+      const saveButton = document.getElementById('btn-save-settings') as HTMLButtonElement;
+      saveButton.disabled = true;
+      this.isExecutingTask = true; this.editorService.getEditor()?.updateOptions({ readOnly: true });
+      try {
+        if (storageMode !== this.fileSystem.getStorageMode()) {
+          await this.editorService.saveAllFiles();
+          if (storageMode === 'browser') await this.fileSystem.useBrowserStorage();
+          else if (!await this.fileSystem.openNativeDirectory()) return;
+          this.editorService.resetWorkspace(); this.clangdService.resetWorkspace(); this.emceptionService.resetWorkspace(); this.lastOutputPaths.clear();
+          await this.showCurrentWorkspace();
+        }
+      } catch (error: any) { alert('切换存储失败，原工作区保留：' + error.message); return; }
+      finally { saveButton.disabled = false; this.isExecutingTask = false; this.editorService.getEditor()?.updateOptions({ readOnly: false }); }
+
 
       this.settings.buildMode = bm;
+      this.settings.storageMode = storageMode;
       this.settings.wasmStorageMode = wsm;
       this.settings.autoSave = as;
       this.settings.cxxStandard = std;
@@ -1454,6 +1470,46 @@ class OnlineCppIDE {
 
     modal.querySelectorAll('.btn-modal-close').forEach((b) => {
       b.addEventListener('click', () => this.closeModals());
+    });
+
+    // Cleanup: Clear Build Cache
+    document.getElementById('btn-clear-cache')?.addEventListener('click', async () => {
+      if (this.isExecutingTask || this.emceptionService.isBusy()) { alert('请等待或中断当前任务后再清理。'); return; }
+      if (!confirm('确认清理构建缓存？将删除 .wasm、.o、.a 等构建产物和 .onlinecpp 缓存目录。源代码文件不受影响。')) return;
+      const task = progressService.start('clear-cache', 'Cleaning build cache...', -1);
+      try {
+        await this.fileSystem.clearCache();
+        const files = await this.fileSystem.listFiles();
+        this.renderFileTree(files);
+        this.logOutput('[Cleanup] Build cache cleared (.wasm, .o, .onlinecpp/* removed).');
+        this.terminalService.writeLine('\x1b[32m[Cleanup] Build cache cleared.\x1b[0m');
+      } catch (error: any) {
+        this.logOutput(`[Cleanup] Failed: ${error.message || error}`);
+        alert('清理失败: ' + error.message);
+      } finally { task.done(); }
+    });
+
+    // Cleanup: Clear All IndexedDB
+    document.getElementById('btn-clear-all-storage')?.addEventListener('click', async () => {
+      if (this.isExecutingTask || this.emceptionService.isBusy()) { alert('请等待或中断当前任务后再清理。'); return; }
+      if (!confirm('⚠️ 确认清空全部 IndexedDB 数据？这将删除浏览器中存储的所有文件、缓存和构建产物。\n\n不会影响:\n• 已导出到外部文件系统的文件\n• 本地磁盘上的文件\n• 编辑器设置\n\n此操作不可撤销！')) return;
+      if (!confirm('再次确认：真的要清空全部 IndexedDB 数据吗？')) return;
+      const task = progressService.start('clear-all', 'Clearing all IndexedDB storage...', -1);
+      try {
+        await this.editorService.saveAllFiles();
+        await this.fileSystem.clearAllStorage();
+        this.emceptionService.resetWorkspace();
+        this.editorService.resetWorkspace();
+        this.clangdService.resetWorkspace();
+        this.lastOutputPaths.clear();
+        const files = await this.fileSystem.listFiles();
+        this.renderFileTree(files);
+        this.logOutput('[Cleanup] All IndexedDB storage cleared.');
+        this.terminalService.writeLine('\x1b[32m[Cleanup] All IndexedDB storage cleared.\x1b[0m');
+      } catch (error: any) {
+        this.logOutput(`[Cleanup] Failed: ${error.message || error}`);
+        alert('清理失败: ' + error.message);
+      } finally { task.done(); }
     });
   }
 
