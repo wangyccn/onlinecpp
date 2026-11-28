@@ -3,6 +3,7 @@ import { openClangdSession, ClangdSession } from '@algoproclub/clangd-wasm';
 import { isClangdWasmSupported } from '@algoproclub/clangd-wasm/support';
 import { DiagnosticItem } from '../types';
 import { scanCpp, isCppComment } from './cppLexical';
+import { ensureClangdAssets } from './clangdAssets';
 
 const lspCancellation = (message: string) => Object.assign(new Error(message), { name: 'AbortError' });
 const isLspCancellation = (error: any) => error?.name === 'AbortError' || [-32800, -32801, -32802].includes(error?.code);
@@ -215,6 +216,14 @@ export class ClangdService {
     const opening = (async () => {
       try {
         this.isInitializing = true; this.notifyStatusChange();
+        // Syntax highlighting must not wait for the 76 MB language-service download.
+        const pendingModel = this.getModelByUri(uri); if (pendingModel) this.runAstDiagnostics(pendingModel);
+        // Parallel + cached: three files in parallel, each split into ranged chunks, so a
+        // slow single CDN stream no longer stalls the language server. A failure keeps the
+        // old behaviour (clangd then fetches its own URLs) instead of disabling LSP.
+        try { await ensureClangdAssets(); }
+        catch (error) { console.warn('[ClangdService] Clang assets unavailable:', error); }
+        if (controller.signal.aborted) return;
         const c = uri.toLowerCase().endsWith('.c');
         const session = await openClangdSession({ uri, signal: controller.signal, compilerArguments: [
           '-x', c ? 'c' : 'c++', c ? '-std=c17' : `-std=${this.standard}`, '-Wno-register', '-Wno-deprecated-register', '-Wno-shift-op-parentheses',

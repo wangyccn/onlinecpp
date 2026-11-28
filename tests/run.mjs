@@ -19,6 +19,8 @@ const lexicalUrl = await moduleUrl('src/services/cppLexical.ts');
 const { scanCpp, isCppComment } = await import(lexicalUrl);
 const bufferedUrl = await moduleUrl('src/services/bufferedFileSystem.ts');
 const { BufferedFileSystem } = await import(bufferedUrl);
+const clangdAssetsUrl = await moduleUrl('src/services/clangdAssets.ts');
+const clangdAssets = await import(clangdAssetsUrl);
 let passed = 0;
 async function test(name, task) { await task(); console.log('PASS', name); passed++; }
 
@@ -28,6 +30,49 @@ await test('canonical local paths and escaped depfiles match the compiler input 
   assert.throws(() => cleanNativePath('../outside'), /escapes/);
   const depfile = 'object: /home/user/src/../my\\ file.hpp ' + String.fromCharCode(92, 10) + ' /home/user/price$$.def /usr/include/stddef.h /home/user/./main.cpp';
   assert.deepEqual(localDependencies(depfile), ['my file.hpp', 'price$.def', 'main.cpp']);
+});
+await test('hashed clangd asset names and sizes are recognised for manual import', async () => {
+  const wasmHead = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+  const plain = new Uint8Array(8);
+  assert.equal(clangdAssets.detectClangdAssetKind('clangd-BNLtU7oc.wasm', wasmHead, 26916224), 'wasm');
+  assert.equal(clangdAssets.detectClangdAssetKind('headers-W_J5ntZV.data', plain, 44185800), 'data');
+  assert.equal(clangdAssets.detectClangdAssetKind('system-DurMFVr8.index', plain, 5365500), 'index');
+  // A browser-renamed download must still be recognised by magic number and size.
+  assert.equal(clangdAssets.detectClangdAssetKind('download.bin', wasmHead, 26916224), 'wasm');
+  assert.equal(clangdAssets.detectClangdAssetKind('download.bin', plain, 44185800), 'data');
+  assert.equal(clangdAssets.detectClangdAssetKind('download.bin', plain, 123), null);
+  assert.equal(clangdAssets.formatBytes(26916224), '25.7 MB');
+  assert.equal(clangdAssets.CLANGD_ASSETS.length, 3);
+});
+await test('ranged chunks download in parallel and reassemble byte-exact', async () => {
+  const { createServer } = await import('node:http');
+  const size = 25 * 1024 * 1024 + 123;          // four chunks with an uneven tail
+  const source = Buffer.allocUnsafe(size);
+  for (let i = 0; i < size; i++) source[i] = (i * 7 + 11) % 251;
+  const server = createServer((req, res) => {
+    res.setHeader('Accept-Ranges', 'bytes');
+    const range = /^bytes=(\d+)-(\d+)$/.exec(String(req.headers.range || ''));
+    if (range) {
+      const start = Number(range[1]), end = Math.min(Number(range[2]), size - 1);
+      res.statusCode = 206;
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+      res.end(source.subarray(start, end + 1));
+      return;
+    }
+    res.setHeader('Content-Length', String(size));
+    res.end(source);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  try {
+    const spec = clangdAssets.CLANGD_ASSETS.find((item) => item.kind === 'data');
+    let received = 0;
+    const blob = await clangdAssets.downloadFromMirrors(spec, [`http://127.0.0.1:${port}/headers.data`], (bytes) => { received += bytes; });
+    assert.equal(blob.size, size);
+    assert.equal(received, size);
+    assert.equal(Buffer.from(await blob.arrayBuffer()).equals(source), true);
+  } finally { server.close(); }
 });
 await test('shared stdout/stderr preserves framing and wraps without corrupting records', async () => {
   const producer = new ProcessOutput(new SharedArrayBuffer(128 + 8)), consumer = new ProcessOutput(producer.shared);
@@ -196,6 +241,8 @@ const clangdUrl = await moduleUrl('src/services/clangdService.ts', {
   "import * as monaco from 'monaco-editor';": 'const monaco = globalThis.__monaco;',
   "import { openClangdSession, ClangdSession } from '@algoproclub/clangd-wasm';": 'const openClangdSession = (...args) => globalThis.__openSession(...args);',
   "import { isClangdWasmSupported } from '@algoproclub/clangd-wasm/support';": 'const isClangdWasmSupported = () => true;',
+  // Asset download is browser-only (Cache Storage + fetch); stub it out of the LSP tests.
+  "import { ensureClangdAssets } from './clangdAssets';": 'const ensureClangdAssets = async () => ({});',
 });
 const { ClangdService } = await import(clangdUrl);
 await test('clangd attach is deduplicated and tab switching reuses document sessions', async () => {

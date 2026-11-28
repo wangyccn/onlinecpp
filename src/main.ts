@@ -9,6 +9,10 @@ import { SimpleRouter } from './router';
 import { FileItem, OpenTab, DiagnosticItem, EditorSettings } from './types';
 import { abortable } from './services/abort';
 import { progressService } from './services/progressService';
+import {
+  CLANGD_ASSETS, clangdAssetDownloadLinks, clearClangdAssetCache, ensureClangdAssets, formatBytes,
+  hasCachedClangdAssets, importClangdAssets, onClangdAssetProgress,
+} from './services/clangdAssets';
 
 class OnlineCppIDE {
   private fileSystem: FileSystemService;
@@ -275,10 +279,10 @@ class OnlineCppIDE {
           <div class="status-item" id="status-problems" title="Errors and Warnings">
             <span id="status-error-count">0</span> errors, <span id="status-warning-count">0</span> warnings
           </div>
-          <div class="status-item" id="status-clangd" title="Clangd WASM Language Server">
+          <button type="button" class="status-item" id="status-clangd" title="Clangd WASM 语言服务 — 点击查看资源状态或手动导入" style="background:none;border:0;color:inherit;font:inherit;cursor:pointer">
             <div class="status-dot"></div>
             <span id="status-clangd-label">clangd WASM</span>
-          </div>
+          </button>
         </div>
 
         <div class="status-right">
@@ -386,6 +390,20 @@ class OnlineCppIDE {
         event.preventDefault(); event.returnValue = '';
       }
     });
+
+    // Parallel clangd asset download progress (three files, ranged chunks, mirror race).
+    let clangdAssetTask: ReturnType<typeof progressService.start> | undefined;
+    onClangdAssetProgress((progress) => {
+      if (progress.done) {
+        clangdAssetTask?.done(); clangdAssetTask = undefined;
+        this.logOutput(`[Clangd] ${progress.label}`);
+        this.updateStatus();
+        return;
+      }
+      if (!clangdAssetTask) clangdAssetTask = progressService.start('clangd-assets', progress.label, 0);
+      clangdAssetTask.update(progress.total ? Math.min(99, (progress.loaded / progress.total) * 100) : -1, progress.label);
+    });
+    document.getElementById('status-clangd')?.addEventListener('click', () => void this.showClangdAssetsDialog());
 
     this.clangdService.onDiagnostics((items) => {
       this.currentDiagnostics = items;
@@ -1225,6 +1243,110 @@ class OnlineCppIDE {
 
     modal.querySelectorAll('.btn-modal-close, .btn-modal-cancel').forEach((b) => {
       b.addEventListener('click', () => this.closeModals());
+    });
+  }
+
+  /**
+   * Fallback for a hostile network: show where to download the language-service files
+   * with the browser and import them by hand.
+   */
+  private async showClangdAssetsDialog(): Promise<void> {
+    const modal = document.getElementById('modal-container');
+    if (!modal) return;
+    const cached = await hasCachedClangdAssets();
+    const rows = CLANGD_ASSETS.map((spec) => {
+      const links = clangdAssetDownloadLinks(spec)
+        .map((link) => `<a href="${link.url}" target="_blank" rel="noreferrer" style="color:#4fc1ff">${link.label}</a>`)
+        .join(' · ');
+      return `<div class="form-group">
+          <label class="form-label" style="display:flex;justify-content:space-between;gap:12px">
+            <span><code>${spec.label}</code> <span style="opacity:.6">${formatBytes(spec.nominalBytes)}</span></span>
+            <span id="clangd-state-${spec.kind}" style="font-size:11px;color:${cached[spec.kind] ? '#4ec9b0' : '#d7ba7d'}">${cached[spec.kind] ? '已缓存' : '缺失'}</span>
+          </label>
+          <span class="form-desc">浏览器下载：${links}</span>
+        </div>`;
+    }).join('');
+
+    modal.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal-card" style="width:min(720px,92vw)">
+          <div class="modal-header">
+            <span>Clang 语言服务资源</span>
+            <button class="icon-btn btn-modal-close"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+          </div>
+          <div class="modal-body">
+            <span class="form-desc">clangd 需要下面 3 个文件（合计约 76 MB）。编辑器会并行分块下载并缓存到 Cache Storage；网络不给力时，请点链接用浏览器下载这些文件再导入（浏览器下载通常比页面内单流快很多）。</span>
+            ${rows}
+            <div id="clangd-drop" style="border:1px dashed rgba(140,140,140,.55);border-radius:6px;padding:20px;text-align:center;font-size:12px;cursor:pointer;user-select:none">
+              把 <code>clangd.wasm</code> / <code>headers.data</code> / <code>system.index</code> 拖到这里，或点击选择文件
+            </div>
+            <input id="clangd-files" type="file" multiple accept=".wasm,.data,.index,.bin" style="display:none">
+            <div id="clangd-import-status" class="form-desc" style="min-height:16px;color:#d7ba7d"></div>
+          </div>
+          <div class="modal-footer">
+            <button class="action-btn" id="clangd-redownload">清除缓存并重新下载</button>
+            <button class="action-btn btn-modal-cancel">关闭</button>
+          </div>
+        </div>
+      </div>`;
+
+    const input = document.getElementById('clangd-files') as HTMLInputElement | null;
+    const drop = document.getElementById('clangd-drop');
+    const statusEl = document.getElementById('clangd-import-status');
+    const report = (text: string, color = '#d7ba7d') => {
+      if (statusEl) { statusEl.textContent = text; statusEl.style.color = color; }
+    };
+    const restartLanguageService = () => {
+      this.clangdService.resetWorkspace();
+      const path = this.editorService.getActivePath();
+      const content = this.editorService.getActiveContent();
+      if (path && content !== null) void this.clangdService.attachDocument(`file:///${path}`, content);
+      this.updateStatus();
+    };
+
+    const importFiles = async (files: File[]) => {
+      if (!files.length) return;
+      report(`正在导入 ${files.length} 个文件…`);
+      const task = progressService.start('clangd-import', 'Importing clangd assets…', -1);
+      try {
+        const result = await importClangdAssets(files);
+        for (const kind of result.imported) {
+          const label = document.getElementById(`clangd-state-${kind}`);
+          if (label) { label.textContent = '已缓存'; label.style.color = '#4ec9b0'; }
+        }
+        if (result.failed.length) report(result.failed.join('；'), '#f48771');
+        else report(`已导入 ${result.imported.length} 个文件，正在重启语言服务…`, '#4ec9b0');
+        if (result.imported.length) {
+          this.logOutput(`[Clangd] Imported language-service assets: ${result.imported.join(', ')}`);
+          restartLanguageService();
+        }
+      } catch (error: any) {
+        report('导入失败：' + (error?.message || error), '#f48771');
+      } finally { task.done(); }
+    };
+
+    drop?.addEventListener('click', () => input?.click());
+    input?.addEventListener('change', () => void importFiles([...(input.files || [])]));
+    drop?.addEventListener('dragover', (event) => { event.preventDefault(); drop.style.borderColor = '#4fc1ff'; });
+    drop?.addEventListener('dragleave', () => { drop.style.borderColor = 'rgba(140,140,140,.55)'; });
+    drop?.addEventListener('drop', (event) => {
+      event.preventDefault(); drop.style.borderColor = 'rgba(140,140,140,.55)';
+      void importFiles([...(event.dataTransfer?.files || [])]);
+    });
+
+    document.getElementById('clangd-redownload')?.addEventListener('click', async () => {
+      await clearClangdAssetCache();
+      report('已清除缓存，开始重新下载…');
+      try {
+        await ensureClangdAssets({ force: true });
+        report('下载完成，正在重启语言服务…', '#4ec9b0');
+        restartLanguageService();
+      } catch (error: any) {
+        report('下载失败：' + (error?.message || error) + '（可以用上面的链接手动下载后导入）', '#f48771');
+      }
+    });
+    modal.querySelectorAll('.btn-modal-close, .btn-modal-cancel').forEach((button) => {
+      button.addEventListener('click', () => this.closeModals());
     });
   }
 
