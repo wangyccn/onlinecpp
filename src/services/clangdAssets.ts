@@ -25,9 +25,9 @@ export interface ClangdAssetSpec {
 }
 
 export const CLANGD_ASSETS: ClangdAssetSpec[] = [
-  { kind: 'wasm', label: 'clangd.wasm', file: 'clangd.wasm', nominalBytes: 26916224, minBytes: 12 * 1024 * 1024, contentType: 'application/wasm' },
-  { kind: 'data', label: 'headers.data', file: 'headers.data', nominalBytes: 44185800, minBytes: 24 * 1024 * 1024, contentType: 'application/octet-stream' },
-  { kind: 'index', label: 'system.index', file: 'system.index', nominalBytes: 5365500, minBytes: 1 * 1024 * 1024, contentType: 'application/octet-stream' },
+  { kind: 'wasm', label: 'clangd.wasm', file: 'clangd.wasm', nominalBytes: 27562174, minBytes: 12 * 1024 * 1024, contentType: 'application/wasm' },
+  { kind: 'data', label: 'headers.data', file: 'headers.data', nominalBytes: 45246257, minBytes: 24 * 1024 * 1024, contentType: 'application/octet-stream' },
+  { kind: 'index', label: 'system.index', file: 'system.index', nominalBytes: 5494222, minBytes: 1 * 1024 * 1024, contentType: 'application/octet-stream' },
 ];
 
 export interface ClangdAssetProgress {
