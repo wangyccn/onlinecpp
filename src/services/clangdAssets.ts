@@ -107,11 +107,20 @@ async function loadManifest(): Promise<ClangdAssetManifest> {
 
 interface ProbeResult { url: string; total: number; ranged: boolean; rate: number }
 
+/** A mirror that never answers must not stall the language service; cap every request. */
+function deadline(ms: number, parent?: AbortSignal): AbortSignal {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+  parent?.addEventListener('abort', () => controller.abort(), { once: true });
+  return controller.signal;
+}
+
 /** A ranged probe doubles as a mirror speed test: the fastest source wins the download. */
 async function probe(url: string, signal?: AbortSignal): Promise<ProbeResult | null> {
   const started = performance.now();
   try {
-    const response = await fetch(url, { headers: { Range: `bytes=0-${PROBE_BYTES - 1}` }, signal, cache: 'no-store' });
+    const response = await fetch(url, { headers: { Range: `bytes=0-${PROBE_BYTES - 1}` }, signal: deadline(8000, signal), cache: 'no-store' });
     if (!response.ok) return null;
     const bytes = await response.arrayBuffer();
     if (!bytes.byteLength) return null;
@@ -140,7 +149,7 @@ async function retry<T>(task: () => Promise<T>, attempts: number, signal?: Abort
 }
 
 async function downloadStreaming(spec: ClangdAssetSpec, source: ProbeResult, onBytes: (bytes: number) => void, signal?: AbortSignal): Promise<Blob> {
-  const response = await fetch(source.url, { signal });
+  const response = await fetch(source.url, { signal: deadline(300000, signal) });
   if (!response.ok) throw new ClangdAssetError(spec.kind, `${spec.label}: HTTP ${response.status}`);
   if (!response.body) {
     const bytes = new Uint8Array(await response.arrayBuffer());
@@ -172,7 +181,7 @@ async function downloadRanged(spec: ClangdAssetSpec, source: ProbeResult, onByte
       const end = Math.min(total, start + CHUNK_BYTES) - 1;
       const expected = end - start + 1;
       parts[index] = await retry(async () => {
-        const response = await fetch(source.url, { headers: { Range: `bytes=${start}-${end}` }, signal });
+        const response = await fetch(source.url, { headers: { Range: `bytes=${start}-${end}` }, signal: deadline(90000, signal) });
         if (response.status !== 206) throw new Error(`HTTP ${response.status}`);
         if ((response.headers.get('content-encoding') || 'identity') !== 'identity') throw new Error('range was re-encoded');
         const bytes = new Uint8Array(await response.arrayBuffer());
@@ -294,11 +303,24 @@ async function run(force: boolean): Promise<ClangdAssetUrls> {
   return urls;
 }
 
-/** Downloads (or reuses) every asset. Concurrent callers share one run. */
-export function ensureClangdAssets(options: { force?: boolean } = {}): Promise<ClangdAssetUrls> {
+/**
+ * Downloads (or reuses) every asset. Concurrent callers share one run.
+ *
+ * The returned promise gives up after `timeoutMs` so a text editor is never blocked
+ * behind a stalled download; the run itself keeps going and is reused next time.
+ */
+export function ensureClangdAssets(options: { force?: boolean; timeoutMs?: number } = {}): Promise<ClangdAssetUrls> {
   if (options.force) readiness = null;
   if (!readiness) readiness = run(!!options.force).catch((error) => { readiness = null; throw error; });
-  return readiness;
+  const pending = readiness, timeoutMs = options.timeoutMs ?? 180000;
+  return new Promise<ClangdAssetUrls>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new ClangdAssetError('all',
+      'Clang 资源下载超时：请检查网络，或点击状态栏 clangd 手动导入已下载的文件')), timeoutMs);
+    pending.then(
+      (urls) => { clearTimeout(timer); resolve(urls); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
 }
 
 /** True when every asset is already cached locally (no network round trip). */
